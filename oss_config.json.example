@@ -2,5 +2,6 @@
   "access_key_id": "在这里填 AccessKey ID",
   "access_key_secret": "在这里填 AccessKey Secret",
   "endpoint": "oss-cn-hangzhou.aliyuncs.com",
-  "bucket": "your-bucket-name"
+  "bucket": "your-bucket-name",
+  "region": "ap-southeast-1"
 }
