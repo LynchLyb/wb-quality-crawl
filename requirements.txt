@@ -1,0 +1,7 @@
+# Flask 宿主（常驻 HTTP 服务 + 后台 worker + cron 巡检）
+flask>=3.1,<4
+waitress>=3.0,<4
+apscheduler>=3.11,<4
+# 既有拉取/上传依赖
+selenium>=4.48
+oss2>=2.19

@@ -1,0 +1,52 @@
+# ============================================================
+#  WB crawl — .gitignore
+#  只提交源码 / 文档 / 依赖清单；绝不提交密钥、登录态、抓取数据、大二进制。
+#  注意：.gitignore 不支持行尾注释，# 必须独占一行，否则整行被当成匹配模式。
+# ============================================================
+
+# ---- 密钥 / 凭据（绝不提交）----
+# oss_config.json = 阿里云 OSS AccessKey
+# config.json     = 各店 seller ID（环境相关）
+# 分别用 oss_config.json.example / config.json.example 代替
+oss_config.json
+config.json
+*.pem
+*.key
+*.p12
+
+# ---- 已登录浏览器 profile（含 WB 会话 cookie / DPAPI 加密凭据）----
+chrome_profile/
+profiles/
+
+# ---- 运行期锁 / 断点状态 ----
+*.lock
+fetch_all.lock
+state.json
+
+# ---- 抓取数据与分片输出（体积大，属产物非源码）----
+data/
+tableListv6_*/
+nmID.txt
+
+# ---- 日志 ----
+*.log
+
+# ---- Python 虚拟环境 / 缓存 ----
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- 浏览器驱动等大二进制（按需另行下载）----
+chromedriver.exe
+chromedriver
+
+# ---- IDE / 编辑器 / 工具缓存 ----
+.idea/
+.vscode/
+.qoder/
+.DS_Store
+Thumbs.db
