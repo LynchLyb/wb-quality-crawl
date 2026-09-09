@@ -47,6 +47,8 @@ chromedriver
 # ---- IDE / 编辑器 / 工具缓存 ----
 .idea/
 .vscode/
-.qoder/
+# .qoder 下只保留 skills（供其他机器的 agent 复用），其余（缓存等）忽略
+.qoder/*
+!.qoder/skills/
 .DS_Store
 Thumbs.db
