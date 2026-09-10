@@ -94,6 +94,27 @@ schtasks /Create /TN "WB_FetchHost" /TR "C:\Users\yuanbo\PycharmProjects\Welcome
 
 任务属性必须 **“只在用户登录时运行”**（Chrome GUI 需交互式会话，会话 0 起不来）。宿主被强杀会留孤儿 chrome，下次启动 `pre_launch_cleanup()` 会按店自动清理。
 
+**优雅下线 / 维护重启**（数据安全，已实测）：分两段——
+
+① **先优雅停 worker**：`POST /stop?store=all`，轮询 `/status` 到各店 `worker_alive=false`（约 15~20s）。worker 跑完当前调用 → 刷分片落盘 + 写 `state.json` 断点 + `driver.quit()` 关 Chrome + 释放 PID 锁，**不丢数据**。
+
+② **再结束宿主壳进程**：`pythonw` 无控制台（无 Ctrl+C）、也无 `/shutdown` 接口，按 8080 属主结束（只匹配 CommandLine 含 `app.py` 的 python/pythonw，避开编辑器 LSP）：
+
+```powershell
+$hp=(Get-NetTCPConnection -LocalPort 8080 -State Listen -EA SilentlyContinue).OwningProcess
+if ($hp) { taskkill /F /T /PID $hp }   # ①已停 worker，故 chrome=0、无孤儿
+```
+
+**⚠️ 看门狗会自动复活宿主**：`WB_FetchHost` 已加「每 2 分钟重复触发 + `MultipleInstances=IgnoreNew`」，宿主被杀后 ≤2 分钟（实测 ~63s）由任务自动重新拉起（无窗口 pythonw），并按 `AUTO_START` 从 `state.json` 续拉。**想让宿主保持下线做维护，必须先禁用任务**，维护完再启用：
+
+```powershell
+Disable-ScheduledTask -TaskName 'WB_FetchHost'   # 维护期间：压住看门狗，宿主不会被拉起
+# ...维护...
+Enable-ScheduledTask  -TaskName 'WB_FetchHost'   # 维护完：恢复登录自启 + 看门狗
+```
+
+要点：`user_stopped` 是**内存态、不落盘**——宿主进程一死该标志即消失，新宿主靠 `AUTO_START=True` + 各店 `auto_start=True` 重新 `--resume` 续拉。故 `/stop` 只停 worker（宿主存活时巡检尊重它），**停不住整个宿主**；要让宿主真正不自动运行只能 `Disable-ScheduledTask`。单店 `/stop` 更不影响看门狗（宿主进程仍在跑）。
+
 ### 6. 多店铺并行（多账号）
 
 同一台机器抓多个 WB 店铺：每店一个独立 Chrome profile（隔离 cookie，同页不同账号不撞登录态）、一个 `FetchSupervisor` worker 线程、一套独立断点/锁/运行目录/OSS prefix 段，三店可并发。
@@ -152,6 +173,7 @@ schtasks /Create /TN "WB_FetchHost" /TR "C:\Users\yuanbo\PycharmProjects\Welcome
 | 多店：`last_error=store_verify_failed` | 下拉框没展开/没读到/点击切换失败（改版或渲染慢）：看日志 `[SELECT]`/`[VERIFY]` 行，必要时更新选择器；终态不自动重启 |
 | worker 反复重启，`last_error` 含 `UnicodeEncodeError: 'gbk'` | 日志 print 里有非 GBK 字符（emoji ✓/✅/❌）；已在 `fetch_all.py` 顶部 `reconfigure(utf-8, errors=replace, line_buffering=True)` 兜底，print 内禁用 emoji（用 `[OK]`/`[X]`/`*`），中文 GBK 可编码不受影响 |
 | `host_new.log` 0 字节但 `/status` 正常在爬 | `Start-Process -WindowStyle Hidden -RedirectStandardOutput` 不落盘（PS 坑）；改 `-NoNewWindow`，或 `python -u app.py > host_new.log 2>&1` |
+| 宿主下线后 ≤2 分钟又被自动拉起（想维护却复活） | `WB_FetchHost` 每 2 分钟重复触发 = 进程级看门狗；`user_stopped` 是内存态、宿主一死即失效 | 维护前 `Disable-ScheduledTask WB_FetchHost`，维护完 `Enable-ScheduledTask WB_FetchHost`；`/stop` 停不住整个宿主 |
 
 ## 禁止事项
 

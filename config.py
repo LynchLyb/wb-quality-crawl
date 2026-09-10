@@ -33,8 +33,8 @@ AUTO_START = True
 STORES = [
     # store1 现有店：已登录，随宿主 AUTO_START 自动续拉
     {"id": "store1", "profile_dir": "chrome_profile",  "data_dir": ".",           "oss_segment": "store1"},
-    # store2 新店：auto_start=False，先跑 login_store.py 登录，再置 True 或 POST /start?store=<id>
-    {"id": "store2", "profile_dir": "profiles/store2", "data_dir": "data/store2", "oss_segment": "store2", "auto_start": False},
+    # store2 已登录并续拉中：auto_start=True，随宿主 AUTO_START 一起自动 --resume 续传（与 store1 一致）
+    {"id": "store2", "profile_dir": "profiles/store2", "data_dir": "data/store2", "oss_segment": "store2", "auto_start": True},
     # store3 已按需求暂时移除（暂不抓取该店数据）；日后需要时照 store2 再加一行即可
 ]
 DEFAULT_STORE = "store1"
