@@ -35,12 +35,34 @@ HEARTBEAT_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "nmid_data", "coordinator.heartbeat")
 
+# 新老交替历史：每次切换追加一行带时间戳的记录，长期留档（供人工/脚本查切换时间）
+SWITCH_HISTORY_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "nmid_data", "switch_history.log")
+
 
 def _write_heartbeat():
     try:
         os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
         with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    except OSError:
+        pass
+
+
+def _log(msg):
+    """带时间戳打印，coordinator.log 每行都含时间，便于核对切换时刻。"""
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+def _record_switch(direction, ok, note=""):
+    """把一次新老交替(时间戳/方向/成败/备注)追加到 switch_history.log。"""
+    try:
+        os.makedirs(os.path.dirname(SWITCH_HISTORY_FILE), exist_ok=True)
+        with open(SWITCH_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {direction} | "
+                    f"{'OK' if ok else 'FAILED'}"
+                    f"{(' | ' + note) if note else ''}\n")
     except OSError:
         pass
 
@@ -104,31 +126,39 @@ def _pending_new_tasks():
 
 def switch_to_new():
     """停旧 → 起新；任一步失败返回 False（停止超时不强行 resume）。"""
-    print("[协调器] 停止旧模块 → 启动新模块")
+    _log("[协调器] 停止旧模块 → 启动新模块")
     if not _http_post(f"{OLD_MODULE}/stop?store=all"):
-        print("[协调器] 旧模块 /stop 调用失败")
+        _log("[协调器] 旧模块 /stop 调用失败")
+        _record_switch("OLD->NEW", False, "old /stop failed")
         return False
     if not wait_worker_stopped(OLD_MODULE):
-        print("[协调器] 旧模块超时未停止，放弃本次切换（避免 profile 冲突）")
+        _log("[协调器] 旧模块超时未停止，放弃本次切换（避免 profile 冲突）")
+        _record_switch("OLD->NEW", False, "old stop timeout")
         return False
     if not _http_post(f"{NEW_MODULE}/resume"):
-        print("[协调器] 新模块 /resume 调用失败")
+        _log("[协调器] 新模块 /resume 调用失败")
+        _record_switch("OLD->NEW", False, "new /resume failed")
         return False
+    _record_switch("OLD->NEW", True, "new window 00:00-12:00")
     return True
 
 
 def switch_to_old():
     """停新 → 起旧；任一步失败返回 False（停止超时不强行 resume）。"""
-    print("[协调器] 停止新模块 → 启动旧模块")
+    _log("[协调器] 停止新模块 → 启动旧模块")
     if not _http_post(f"{NEW_MODULE}/stop"):
-        print("[协调器] 新模块 /stop 调用失败")
+        _log("[协调器] 新模块 /stop 调用失败")
+        _record_switch("NEW->OLD", False, "new /stop failed")
         return False
     if not wait_worker_stopped(NEW_MODULE):
-        print("[协调器] 新模块超时未停止，放弃本次切换（避免 profile 冲突）")
+        _log("[协调器] 新模块超时未停止，放弃本次切换（避免 profile 冲突）")
+        _record_switch("NEW->OLD", False, "new stop timeout")
         return False
     if not _http_post(f"{OLD_MODULE}/resume?store=all"):
-        print("[协调器] 旧模块 /resume 调用失败")
+        _log("[协调器] 旧模块 /resume 调用失败")
+        _record_switch("NEW->OLD", False, "old /resume failed")
         return False
+    _record_switch("NEW->OLD", True, "old window 12:00-24:00")
     return True
 
 
@@ -137,9 +167,9 @@ def _switch_with_retry(fn, label):
     for i in range(1, SWITCH_RETRY + 1):
         if fn():
             return True
-        print(f"[协调器] {label}失败（第 {i}/{SWITCH_RETRY} 次），{SWITCH_RETRY_INTERVAL}s 后重试")
+        _log(f"[协调器] {label}失败（第 {i}/{SWITCH_RETRY} 次），{SWITCH_RETRY_INTERVAL}s 后重试")
         time.sleep(SWITCH_RETRY_INTERVAL)
-    print(f"[协调器] {label}重试 {SWITCH_RETRY} 次仍失败，等待主循环下轮重试")
+    _log(f"[协调器] {label}重试 {SWITCH_RETRY} 次仍失败，等待主循环下轮重试")
     return False
 
 
@@ -149,9 +179,9 @@ def _in_new_window(now):
 
 
 def main():
-    print(f"[协调器] 启动：天级轮转，新模块每天 {NEW_START_HOUR:02d}:00-"
-          f"{NEW_START_HOUR + NEW_HOURS:02d}:00（{NEW_HOURS}h），"
-          f"旧模块其余 {24 - NEW_HOURS}h")
+    _log(f"[协调器] 启动：天级轮转，新模块每天 {NEW_START_HOUR:02d}:00-"
+         f"{NEW_START_HOUR + NEW_HOURS:02d}:00（{NEW_HOURS}h），"
+         f"旧模块其余 {24 - NEW_HOURS}h")
 
     while True:
         try:
@@ -178,11 +208,11 @@ def main():
                     _switch_with_retry(switch_to_old, "切旧模块")
                 elif not _worker_alive(OLD_MODULE):
                     if not _http_post(f"{OLD_MODULE}/resume?store=all"):
-                        print("[协调器] 旧模块 /resume 调用失败，下轮重试")
+                        _log("[协调器] 旧模块 /resume 调用失败，下轮重试")
             time.sleep(60)
         except Exception as e:
             # 守护：单次循环异常不杀死协调器进程
-            print(f"[协调器] 主循环异常: {type(e).__name__}: {e}，60s 后继续")
+            _log(f"[协调器] 主循环异常: {type(e).__name__}: {e}，60s 后继续")
             time.sleep(60)
 
 
