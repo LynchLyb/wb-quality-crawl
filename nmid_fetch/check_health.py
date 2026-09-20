@@ -83,7 +83,7 @@ def main():
                 else f"疑似已死 (心跳{int(age)}s前)"
         except (OSError, ValueError):
             coord_state = "心跳异常"
-    rows.append(("协调器", coord_state, "-", "80:20→99:1 轮转"))
+    rows.append(("协调器", coord_state, "-", "新:旧 2:8 时间片轮转"))
 
     # 打印表格
     print(f"{'组件':<16}{'HTTP/进程':<24}{'Worker':<10}{'说明'}")

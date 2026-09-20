@@ -11,6 +11,11 @@
     - 新模块当天全部完成 → 剩余时间旧模块 100% 跑
     - 新模块跨天未完成 → 第二天继续轮转
 
+守护:
+    - 切换失败重试 3 次；停止超时则放弃本次切换（避免 profile 冲突）
+    - 主循环 try/except 包裹，单次异常不致进程猝死
+    - 心跳文件供 check_health.py 判断存活
+
 用法:
     python -m nmid_fetch.coordinator
 """
@@ -56,10 +61,12 @@ def _http_post(url, timeout=10):
     except Exception:
         return False
 
-NEW_RATIO = 0.99           # 新模块时间占比（新优先；旧模块保底 1%）
+NEW_RATIO = 0.2            # 新模块时间占比（新 20% / 旧 80%；新数据量小，旧模块保生产）
 CYCLE_MINUTES = 60         # 轮转周期（分钟）
 NEW_START_HOUR = 0         # 每天新模块优先启动的小时
 STOP_WAIT_TIMEOUT = 30     # 等待模块完全停止的最长时间（秒）
+SWITCH_RETRY = 3           # 切换失败重试次数
+SWITCH_RETRY_INTERVAL = 5  # 切换重试间隔（秒）
 
 
 def _worker_alive(base_url):
@@ -93,17 +100,44 @@ def _pending_new_tasks():
 
 
 def switch_to_new():
+    """停旧 → 起新；任一步失败返回 False（停止超时不强行 resume）。"""
     print("[协调器] 停止旧模块 → 启动新模块")
-    _http_post(f"{OLD_MODULE}/stop?store=all")
-    wait_worker_stopped(OLD_MODULE)
-    _http_post(f"{NEW_MODULE}/resume")
+    if not _http_post(f"{OLD_MODULE}/stop?store=all"):
+        print("[协调器] 旧模块 /stop 调用失败")
+        return False
+    if not wait_worker_stopped(OLD_MODULE):
+        print("[协调器] 旧模块超时未停止，放弃本次切换（避免 profile 冲突）")
+        return False
+    if not _http_post(f"{NEW_MODULE}/resume"):
+        print("[协调器] 新模块 /resume 调用失败")
+        return False
+    return True
 
 
 def switch_to_old():
+    """停新 → 起旧；任一步失败返回 False（停止超时不强行 resume）。"""
     print("[协调器] 停止新模块 → 启动旧模块")
-    _http_post(f"{NEW_MODULE}/stop")
-    wait_worker_stopped(NEW_MODULE)
-    _http_post(f"{OLD_MODULE}/resume?store=all")
+    if not _http_post(f"{NEW_MODULE}/stop"):
+        print("[协调器] 新模块 /stop 调用失败")
+        return False
+    if not wait_worker_stopped(NEW_MODULE):
+        print("[协调器] 新模块超时未停止，放弃本次切换（避免 profile 冲突）")
+        return False
+    if not _http_post(f"{OLD_MODULE}/resume?store=all"):
+        print("[协调器] 旧模块 /resume 调用失败")
+        return False
+    return True
+
+
+def _switch_with_retry(fn, label):
+    """切换失败重试；重试用尽交还主循环下轮处理，不强行操作。"""
+    for i in range(1, SWITCH_RETRY + 1):
+        if fn():
+            return True
+        print(f"[协调器] {label}失败（第 {i}/{SWITCH_RETRY} 次），{SWITCH_RETRY_INTERVAL}s 后重试")
+        time.sleep(SWITCH_RETRY_INTERVAL)
+    print(f"[协调器] {label}重试 {SWITCH_RETRY} 次仍失败，等待主循环下轮重试")
+    return False
 
 
 def _new_all_finished():
@@ -120,40 +154,45 @@ def main():
     print(f"[协调器] 启动：新模块占比 {NEW_RATIO:.0%}（{new_minutes}min / {old_minutes}min 每周期）")
 
     while True:
-        _write_heartbeat()
-        now = datetime.now()
-        today = now.date()
+        try:
+            _write_heartbeat()
+            now = datetime.now()
+            today = now.date()
 
-        if not _pending_new_tasks():
-            # 新模块无数据：旧模块 100% 跑
-            if _worker_alive(NEW_MODULE):
-                switch_to_old()
-            time.sleep(60)
-            continue
-
-        # 每天首次检测到新数据：优先启动新模块
-        if last_new_day != today and now.hour >= NEW_START_HOUR:
-            print(f"[协调器] {today} 检测到新数据，优先启动新模块")
-            switch_to_new()
-            last_new_day = today
-
-        # 新模块时间片
-        if not _worker_alive(NEW_MODULE):
-            switch_to_new()
-        for _ in range(new_minutes):
-            time.sleep(60)
-            if _new_all_finished():
-                print("[协调器] 新模块已完成全部任务，切回旧模块")
-                switch_to_old()
-                # 旧模块跑到当天结束
-                while datetime.now().date() == today:
-                    time.sleep(60)
-                break
-        else:
-            # 新模块时间片用完（未完成）：切旧模块时间片
-            switch_to_old()
-            for _ in range(old_minutes):
+            if not _pending_new_tasks():
+                # 新模块无数据：旧模块 100% 跑
+                if _worker_alive(NEW_MODULE):
+                    _switch_with_retry(switch_to_old, "切旧模块")
                 time.sleep(60)
+                continue
+
+            # 每天首次检测到新数据：优先启动新模块
+            if last_new_day != today and now.hour >= NEW_START_HOUR:
+                print(f"[协调器] {today} 检测到新数据，优先启动新模块")
+                if _switch_with_retry(switch_to_new, "切新模块"):
+                    last_new_day = today   # 成功才记；失败下轮循环重试
+
+            # 新模块时间片
+            if not _worker_alive(NEW_MODULE):
+                _switch_with_retry(switch_to_new, "切新模块")
+            for _ in range(new_minutes):
+                time.sleep(60)
+                if _new_all_finished():
+                    print("[协调器] 新模块已完成全部任务，切回旧模块")
+                    _switch_with_retry(switch_to_old, "切旧模块")
+                    # 旧模块跑到当天结束
+                    while datetime.now().date() == today:
+                        time.sleep(60)
+                    break
+            else:
+                # 新模块时间片用完（未完成）：切旧模块时间片
+                _switch_with_retry(switch_to_old, "切旧模块")
+                for _ in range(old_minutes):
+                    time.sleep(60)
+        except Exception as e:
+            # 守护：单次循环异常不杀死协调器进程
+            print(f"[协调器] 主循环异常: {type(e).__name__}: {e}，60s 后继续")
+            time.sleep(60)
 
 
 if __name__ == "__main__":

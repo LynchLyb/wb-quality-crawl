@@ -1,6 +1,6 @@
 # 技术方案：按 nmID 集合抓取 WB 商品数据（nmid_fetch 模块）
 
-> 状态：设计评审中（分支 `nmid-fetch`）
+> 状态：代码已完成并推送（分支 `nmid-fetch`，commit `53fce1e`），待 Windows 部署测试
 > 原则：零侵入（不改动任何现有代码）、最大复用、格式一致、可续传、串行调度
 
 ---
@@ -41,7 +41,8 @@ nmid_fetch/
 ├── oss_input.py             # OSS 输入文件扫描/下载/解析
 ├── fetch_by_nmid.py         # 核心逻辑：按 nmID 查询 + 分片 + 上传
 ├── app_nmid.py              # Flask 宿主入口：常驻循环 + HTTP 接口（端口 8081）
-└── coordinator.py           # 外部协调器：新旧模块时间片轮转调度
+├── coordinator.py           # 外部协调器：新旧模块时间片轮转调度（含重试/心跳守护）
+└── check_health.py          # 一键健康检测：旧/新/协调器存活 + 互斥检查
 ```
 
 运行后生成的数据目录：
@@ -245,41 +246,42 @@ Chrome profile 独占：同一 profile 同一时刻只能被一个 Chrome 进程
 | 规则 | 说明 |
 |---|---|
 | **新模块未准备好** | 旧模块 100% 跑 |
-| **新模块准备好后** | 按 **80:20 时间片**轮转（新 48 分钟 / 旧 12 分钟，周期 60 分钟） |
+| **新模块准备好后** | 按 **2:8 时间片**轮转（新 12 分钟 / 旧 48 分钟，周期 60 分钟；每天 00:00 新模块仍优先启动） |
 | **每天新模块优先** | 每天 00:00 优先启动新模块 |
 | **新模块当天完成** | 剩余时间旧模块 100% 跑 |
-| **新模块跨天未完成** | 第二天继续 80:20 轮转 |
+| **新模块跨天未完成** | 第二天继续 2:8 轮转 |
 
 ### 9.3 协调器逻辑
 
 ```python
-# coordinator.py
+# coordinator.py（实际代码要点，标准库 urllib，无新增依赖）
 OLD_MODULE = "http://127.0.0.1:8080"
 NEW_MODULE = "http://127.0.0.1:8081"
-NEW_RATIO = 0.8
+NEW_RATIO = 0.2           # 新模块时间占比（新 20% / 旧 80%）
 CYCLE_MINUTES = 60
+HEARTBEAT_FILE = "nmid_data/coordinator.heartbeat"  # 每循环写一次，供 check_health 判活
 
-def has_new_data():
-    """调新模块 /status，检查是否有待处理任务"""
-    r = requests.get(f"{NEW_MODULE}/status", timeout=5)
-    return r.json().get("pending_task_count", 0) > 0
-
-def switch_to_new():
-    requests.post(f"{OLD_MODULE}/stop?store=all")
-    wait_worker_stopped(OLD_MODULE)   # 轮询 /status 确认 worker_alive=false
-    requests.post(f"{NEW_MODULE}/resume")
+def switch_to_new():      # 任一步失败返回 False
+    _http_post(f"{OLD_MODULE}/stop?store=all")
+    if not wait_worker_stopped(OLD_MODULE):   # 轮询 /status 确认 worker_alive=false
+        return False      # 超时未停止 → 放弃本次切换，避免 profile 冲突
+    return _http_post(f"{NEW_MODULE}/resume")
 
 def switch_to_old():
-    requests.post(f"{NEW_MODULE}/stop")
-    wait_worker_stopped(NEW_MODULE)
-    requests.post(f"{OLD_MODULE}/resume?store=all")
+    _http_post(f"{NEW_MODULE}/stop")
+    if not wait_worker_stopped(NEW_MODULE):
+        return False
+    return _http_post(f"{OLD_MODULE}/resume?store=all")
+
+# 守护：切换失败重试 3 次（_switch_with_retry）
+#       主循环 try/except 包裹，单次异常不杀死协调器进程
 ```
 
 ### 9.4 对旧模块的影响
 
 - **代码零改动**：协调器只调用旧模块已有的 `/stop` `/resume` HTTP 接口
 - **数据不丢失**：旧模块 stop 时保存断点，resume 从断点继续
-- **变慢 5 倍**：旧模块只有 20% 时间跑（已确认接受）
+- **变慢**：新模块有数据且未完成时，旧模块拿 80% 时间（每小时 48 分钟）；新模块当天完成后旧模块恢复 100%（已确认接受）
 - **启动开销**：每次 resume 增加 10-30 秒（重启 Chrome + 选店 + 捕获请求），占比约 2.8%
 
 ### 9.5 快速切换方式
@@ -294,6 +296,21 @@ curl -X POST "http://127.0.0.1:8081/stop"
 curl -X POST "http://127.0.0.1:8080/resume?store=all"
 ```
 
+### 9.6 心跳与健康检测
+
+- 协调器每轮主循环写一次 `nmid_data/coordinator.heartbeat`（内容为时间戳）
+- 一键检测（Windows 机运行）：
+
+```powershell
+python -m nmid_fetch.check_health
+```
+
+- 检测项：
+  - 旧模块（8080）：HTTP 存活 + worker 是否在跑
+  - 新模块（8081）：HTTP 存活 + worker 是否在跑 + 待处理 task 数
+  - 协调器：心跳文件年龄（<180s 视为存活）
+  - 互斥检查：新旧 worker 同时为 true 时告警（profile 冲突风险）
+
 ---
 
 ## 10. 效率与风险
@@ -302,7 +319,7 @@ curl -X POST "http://127.0.0.1:8080/resume?store=all"
 
 - `CALL_INTERVAL = 1.5` 秒（限流 60 秒 40 次）
 - 20 万 nmID × 1.5 秒 ≈ **83.3 小时/店铺**
-- 新模块占 80% 时间 → 实际需要 **104 小时 ≈ 4.3 天/店铺**
+- 新模块占 20% 时间 → 20 万规模需 **约 416.5 小时 ≈ 17.4 天/店铺**；当前实际数据仅约数千 nmID（≈1.25 小时纯查询），20% 占比下约 6 小时跑完
 - 接口不支持批量查询，无法优化
 
 ### 风险
@@ -313,8 +330,9 @@ curl -X POST "http://127.0.0.1:8080/resume?store=all"
 | 效率低 | 83.3 小时/店铺 | 接受 |
 | WB 风控 | 长时间高频查询可能触发限流 | 复用现有 429 退避逻辑 |
 | 登录态过期 | 长时间运行 token 可能过期 | 每次 resume 重新捕获请求头 |
-| 旧模块变慢 | 只有 20% 时间跑 | 已确认接受 |
-| 切换冲突 | Chrome 未完全关闭时切换 | 协调器轮询 /status 确认停止 |
+| 旧模块变慢 | 新模块有数据期间只有 80% 时间跑 | 已确认接受 |
+| 切换冲突 | Chrome 未完全关闭时切换 | 协调器轮询 /status 确认停止；**超时放弃本次切换**，不强行 resume |
+| 协调器猝死/切换失败 | 无进程级守护；单次 HTTP 失败可能错过切换 | 主循环 try/except 防猝死 + 心跳文件 + check_health 检测；切换失败重试 3 次后等下轮循环 |
 
 ---
 
@@ -323,11 +341,13 @@ curl -X POST "http://127.0.0.1:8080/resume?store=all"
 | 步骤 | 内容 | 状态 |
 |---|---|---|
 | 1 | 创建 `nmid_fetch/` 目录、`__init__.py`、`README.md` | ✅ 已完成 |
-| 2 | 创建 `oss_input.py`：OSS 扫描/下载/解析 | 待执行 |
-| 3 | 创建 `fetch_by_nmid.py`：查询循环 + 分片 + 断点 | 待执行 |
-| 4 | 创建 `app_nmid.py`：Flask 宿主 + HTTP 接口 | 待执行 |
-| 5 | 创建 `coordinator.py`：协调器 | 待执行 |
-| 6 | 测试：小批量 nmID 验证全流程 | 待执行 |
+| 2 | 创建 `oss_input.py`：OSS 扫描/下载/解析 | ✅ 已完成 |
+| 3 | 创建 `fetch_by_nmid.py`：查询循环 + 分片 + 断点 | ✅ 已完成 |
+| 4 | 创建 `app_nmid.py`：Flask 宿主 + HTTP 接口 | ✅ 已完成 |
+| 5 | 创建 `coordinator.py`：协调器（重试/心跳守护） | ✅ 已完成 |
+| 5.5 | 创建 `check_health.py`：一键健康检测 | ✅ 已完成 |
+| 5.6 | 代码推送远程 `nmid-fetch`（commit `53fce1e`） | ✅ 已完成 |
+| 6 | 测试：小批量 nmID 验证全流程 | 待执行（Windows 机） |
 
 ---
 
@@ -338,5 +358,6 @@ curl -X POST "http://127.0.0.1:8080/resume?store=all"
 | 1. 单元验证 | `oss_input.py` 函数 | OSS 扫描、CSV 解析、店铺映射 |
 | 2. 小批量端到端 | 10 个 nmID | Chrome 启动、选店、查询、分片、上传 |
 | 3. 协调器切换 | 短周期（2 分钟） | 新旧模块交替、无冲突 |
+| 3.5 健康检测与守护 | `python -m nmid_fetch.check_health`；手动杀协调器再重启 | 三方状态准确、互斥告警生效；协调器重启后调度自动恢复 |
 | 4. 断点续传 | Ctrl+C 后 --resume | 从断点继续、不重复查询 |
 | 5. 压力测试 | 真实 20 万 nmID | 内存、分片、上传稳定性 |
