@@ -7,12 +7,14 @@
 
 调度规则:
     - 新模块无待处理数据 → 旧模块 100% 跑
-    - 新模块有数据 → 每天 00:00 优先启动新模块，之后按 NEW_RATIO 时间片轮转
-    - 新模块当天全部完成 → 剩余时间旧模块 100% 跑
-    - 新模块跨天未完成 → 第二天继续轮转
+    - 新模块有数据 → 天级轮转：新模块每天跑 NEW_START_HOUR 起的 NEW_HOURS 小时（默认 00:00-12:00）
+    - 新模块窗口外 → 旧模块跑（断点续传）
+    - 新模块窗口内未跑完 → 第二天窗口从断点继续
 
 守护:
     - 切换失败重试 3 次；停止超时则放弃本次切换（避免 profile 冲突）
+    - 停止等待超时 180s（覆盖旧模块首捕 120s + 限流暂停 30s 的最坏优雅停止耗时）
+    - 新模块窗口内每分钟补发旧模块 /stop，防旧宿主 AUTO_START/崩溃重启复活 worker
     - 主循环 try/except 包裹，单次异常不致进程猝死
     - 心跳文件供 check_health.py 判断存活
 
@@ -61,10 +63,11 @@ def _http_post(url, timeout=10):
     except Exception:
         return False
 
-NEW_RATIO = 0.2            # 新模块时间占比（新 20% / 旧 80%；新数据量小，旧模块保生产）
-CYCLE_MINUTES = 60         # 轮转周期（分钟）
-NEW_START_HOUR = 0         # 每天新模块优先启动的小时
-STOP_WAIT_TIMEOUT = 30     # 等待模块完全停止的最长时间（秒）
+NEW_START_HOUR = 0         # 新模块每天窗口开始小时（可调）
+NEW_HOURS = 12             # 新模块每天运行小时数（可调；旧模块跑剩余 24-NEW_HOURS 小时）
+                           # 约束: NEW_START_HOUR + NEW_HOURS <= 24（窗口不跨天）
+STOP_WAIT_TIMEOUT = 180    # 等待模块完全停止的最长时间（秒）；旧模块优雅停止最坏
+                           # ≈ 首捕 CAPTURE_TIMEOUT 120s + 限流 RATE_LIMIT_PAUSE 30s + 周期余量
 SWITCH_RETRY = 3           # 切换失败重试次数
 SWITCH_RETRY_INTERVAL = 5  # 切换重试间隔（秒）
 
@@ -140,24 +143,20 @@ def _switch_with_retry(fn, label):
     return False
 
 
-def _new_all_finished():
-    """新模块当前是否无待处理/已全部完成（worker 空闲且无 pending）。"""
-    return not _pending_new_tasks()
+def _in_new_window(now):
+    """当前是否处于新模块每天运行窗口（窗口不跨天）。"""
+    return NEW_START_HOUR <= now.hour < NEW_START_HOUR + NEW_HOURS
 
 
 def main():
-    new_minutes = int(CYCLE_MINUTES * NEW_RATIO)
-    old_minutes = CYCLE_MINUTES - new_minutes
-    last_new_day = None
-
-    # 启动时默认旧模块跑（新模块数据未准备好时不抢）
-    print(f"[协调器] 启动：新模块占比 {NEW_RATIO:.0%}（{new_minutes}min / {old_minutes}min 每周期）")
+    print(f"[协调器] 启动：天级轮转，新模块每天 {NEW_START_HOUR:02d}:00-"
+          f"{NEW_START_HOUR + NEW_HOURS:02d}:00（{NEW_HOURS}h），"
+          f"旧模块其余 {24 - NEW_HOURS}h")
 
     while True:
         try:
             _write_heartbeat()
             now = datetime.now()
-            today = now.date()
 
             if not _pending_new_tasks():
                 # 新模块无数据：旧模块 100% 跑
@@ -166,29 +165,21 @@ def main():
                 time.sleep(60)
                 continue
 
-            # 每天首次检测到新数据：优先启动新模块
-            if last_new_day != today and now.hour >= NEW_START_HOUR:
-                print(f"[协调器] {today} 检测到新数据，优先启动新模块")
-                if _switch_with_retry(switch_to_new, "切新模块"):
-                    last_new_day = today   # 成功才记；失败下轮循环重试
-
-            # 新模块时间片
-            if not _worker_alive(NEW_MODULE):
-                _switch_with_retry(switch_to_new, "切新模块")
-            for _ in range(new_minutes):
-                time.sleep(60)
-                if _new_all_finished():
-                    print("[协调器] 新模块已完成全部任务，切回旧模块")
-                    _switch_with_retry(switch_to_old, "切旧模块")
-                    # 旧模块跑到当天结束
-                    while datetime.now().date() == today:
-                        time.sleep(60)
-                    break
+            if _in_new_window(now):
+                # 新模块窗口：新模块跑（断点续传）
+                if _worker_alive(OLD_MODULE):
+                    # 持续压制：防旧宿主 AUTO_START/崩溃重启复活 worker 抢 profile
+                    _http_post(f"{OLD_MODULE}/stop?store=all")
+                if not _worker_alive(NEW_MODULE):
+                    _switch_with_retry(switch_to_new, "切新模块")
             else:
-                # 新模块时间片用完（未完成）：切旧模块时间片
-                _switch_with_retry(switch_to_old, "切旧模块")
-                for _ in range(old_minutes):
-                    time.sleep(60)
+                # 旧模块窗口：旧模块跑
+                if _worker_alive(NEW_MODULE):
+                    _switch_with_retry(switch_to_old, "切旧模块")
+                elif not _worker_alive(OLD_MODULE):
+                    if not _http_post(f"{OLD_MODULE}/resume?store=all"):
+                        print("[协调器] 旧模块 /resume 调用失败，下轮重试")
+            time.sleep(60)
         except Exception as e:
             # 守护：单次循环异常不杀死协调器进程
             print(f"[协调器] 主循环异常: {type(e).__name__}: {e}，60s 后继续")

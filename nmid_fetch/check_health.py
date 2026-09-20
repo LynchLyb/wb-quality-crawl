@@ -11,6 +11,8 @@ import os
 import urllib.request
 from datetime import datetime
 
+from nmid_fetch.coordinator import NEW_HOURS, NEW_START_HOUR
+
 OLD_MODULE = "http://127.0.0.1:8080"
 NEW_MODULE = "http://127.0.0.1:8081"
 HEARTBEAT_FILE = os.path.join(
@@ -83,7 +85,8 @@ def main():
                 else f"疑似已死 (心跳{int(age)}s前)"
         except (OSError, ValueError):
             coord_state = "心跳异常"
-    rows.append(("协调器", coord_state, "-", "新:旧 2:8 时间片轮转"))
+    rows.append(("协调器", coord_state, "-",
+                 f"天级轮转 新{NEW_HOURS}h/旧{24 - NEW_HOURS}h（{NEW_START_HOUR:02d}:00 起）"))
 
     # 打印表格
     print(f"{'组件':<16}{'HTTP/进程':<24}{'Worker':<10}{'说明'}")
