@@ -23,6 +23,7 @@
 """
 import json
 import os
+import sys
 import time
 import urllib.request
 from datetime import datetime
@@ -39,6 +40,24 @@ HEARTBEAT_FILE = os.path.join(
 SWITCH_HISTORY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "nmid_data", "switch_history.log")
+
+# 日志落盘：协调器同样以 pythonw 无控制台拉起、print 会进黑洞，统一追加到 nmid_data/coordinator.log。
+# 启动时把上一份降级为 .old（只保留一代）；_log 自带每行时间戳。
+_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "nmid_data", "coordinator.log")
+os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+if os.path.exists(_LOG_PATH):
+    try:
+        os.replace(_LOG_PATH, _LOG_PATH + ".old")
+    except OSError:
+        pass
+_logf = open(_LOG_PATH, "a", encoding="utf-8", buffering=1)
+if sys.stdout is None or sys.stderr is None:   # pythonw：无控制台
+    sys.stdout = sys.stderr = _logf
+else:                                          # 交互终端：fd 级重定向
+    os.dup2(_logf.fileno(), 1)
+    os.dup2(_logf.fileno(), 2)
 
 
 def _write_heartbeat():
@@ -86,7 +105,7 @@ def _http_post(url, timeout=10):
         return False
 
 NEW_START_HOUR = 0         # 新模块每天窗口开始小时（可调）
-NEW_HOURS = 12             # 新模块每天运行小时数（可调；旧模块跑剩余 24-NEW_HOURS 小时）
+NEW_HOURS = 24             # 新模块每天运行小时数（可调；24=全量跑新，旧模块仅在无待处理 nmID 任务时兜底）
                            # 约束: NEW_START_HOUR + NEW_HOURS <= 24（窗口不跨天）
 STOP_WAIT_TIMEOUT = 180    # 等待模块完全停止的最长时间（秒）；旧模块优雅停止最坏
                            # ≈ 首捕 CAPTURE_TIMEOUT 120s + 限流 RATE_LIMIT_PAUSE 30s + 周期余量

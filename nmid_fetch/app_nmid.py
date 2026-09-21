@@ -10,6 +10,8 @@
     - 旧模块每店一个 supervisor + cron 巡检；本模块单 worker 串行遍历所有 (task, store)
     - 本模块不自动重启（由协调器控制 stop/resume），避免与旧模块抢 profile
 """
+import os
+import sys
 import threading
 import time
 
@@ -23,6 +25,22 @@ from nmid_fetch.fetch_by_nmid import (
     store_id_for_seller,
 )
 from fetch_all import acquire_single_instance, release_single_instance
+
+# 日志落盘：pythonw 无控制台、print 会进黑洞，统一追加到 nmid_data/app_nmid.log。
+# 启动时把上一份降级为 .old（只保留一代），避免无限增长；崩溃重启后上次运行现场仍在 .old 可查。
+_LOG_PATH = os.path.join(config.BASE_DIR, "nmid_data", "app_nmid.log")
+os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+if os.path.exists(_LOG_PATH):
+    try:
+        os.replace(_LOG_PATH, _LOG_PATH + ".old")
+    except OSError:
+        pass
+_logf = open(_LOG_PATH, "a", encoding="utf-8", buffering=1)
+if sys.stdout is None or sys.stderr is None:   # pythonw：无控制台
+    sys.stdout = sys.stderr = _logf
+else:                                          # 交互终端：fd 级重定向，子线程 print 也进文件
+    os.dup2(_logf.fileno(), 1)
+    os.dup2(_logf.fileno(), 2)
 
 HOST = "127.0.0.1"
 PORT = 8081

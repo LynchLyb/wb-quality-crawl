@@ -40,8 +40,8 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-# 本模块专用常量（限流 60 秒 40 次 → 间隔至少 1.5 秒）
-CALL_INTERVAL = 1.5
+# 本模块专用常量（限流 60 秒 40 次 → 请求发起间隔下限 1.6 秒，对红线留余量）
+CALL_INTERVAL = 1.6
 SHARD_SIZE = 2000       # 每 2000 次查询写一个分片
 
 # 数据根目录：nmid_data/<store_id>/<task_id>/
@@ -273,6 +273,7 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
             post_data = json.dumps(body, ensure_ascii=False)
 
             query_count += 1
+            t_req = time.perf_counter()
             try:
                 status, text = call_api(driver, first["url"], first["method"], headers, post_data)
             except Exception as e:
@@ -283,6 +284,7 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
                 time.sleep(10)
                 query_count -= 1
                 continue
+            dt_req = time.perf_counter() - t_req
             if status == 429:
                 print(f"[RATE-LIMIT] 429 限流，暂停 {RATE_LIMIT_PAUSE} 秒重试...")
                 time.sleep(RATE_LIMIT_PAUSE)
@@ -336,7 +338,8 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
                 save_state(run_dir, run_ts, shard_index, query_count,
                            matched_count, processed_index)
 
-            time.sleep(CALL_INTERVAL)
+            # 自适应睡眠：把“请求发起间隔”钉在 CALL_INTERVAL——慢请求少睡/不睡，快请求补足余量
+            time.sleep(max(0.0, CALL_INTERVAL - dt_req))
 
         finished = idx >= len(nmids) and not _stopped()
         result["finished"] = finished
