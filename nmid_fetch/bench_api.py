@@ -126,7 +126,7 @@ def main():
     ap.add_argument("--out", help="可选：明细结果 JSON 输出路径")
     args = ap.parse_args()
 
-    store = next((s for s in config.STORES if s["id"] == args.store), None)
+    store = config.get_store(args.store)  # 已解析店铺：profile_dir 为绝对路径（config.STORES 原值是相对路径，直接建 driver 会致 --user-data-dir 解析失败/DevToolsActivePort）
     if store is None:
         print(f"[BENCH] 未知店铺: {args.store}（可选: {[s['id'] for s in config.STORES]}）")
         return 2
