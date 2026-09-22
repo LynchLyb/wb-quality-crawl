@@ -41,8 +41,15 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 # 本模块专用常量（限流 60 秒 40 次 → 请求发起间隔下限 1.6 秒，对红线留余量）
-CALL_INTERVAL = 1.6
+CALL_INTERVAL = 1.6     # 间隔下限 floor：平稳时按此跑，最快
 SHARD_SIZE = 2000       # 每 2000 次查询写一个分片
+
+# 闭环退避：撞 429 → base ×BACKOFF_UP（封顶 BACKOFF_CAP）；连续 BACKOFF_CLEAN_STREAK
+# 条干净 → base ×BACKOFF_DOWN（回落到 CALL_INTERVAL 为止）。退避快、回收慢。
+BACKOFF_CAP = 2.4           # 间隔上限 cap：硬限流时最慢跑这个
+BACKOFF_UP = 1.5            # 撞 429 的放大系数（1.6×1.5=2.4，一次即到顶）
+BACKOFF_DOWN = 0.95         # 每满一个干净窗口的回收系数
+BACKOFF_CLEAN_STREAK = 50   # 触发一次回收所需的连续干净条数
 
 # 数据根目录：nmid_data/<store_id>/<task_id>/
 DATA_ROOT = os.path.join(config.BASE_DIR, "nmid_data")
@@ -251,6 +258,8 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
         buffer = []
         consecutive_fail = 0
         server_fail = 0
+        base_interval = CALL_INTERVAL   # 闭环退避动态间隔，起始 = floor
+        clean_streak = 0                # 连续干净（非 429）计数，用于回收 base
         _prog(status="running", task_id=task_id, processed_index=processed_index,
               total=len(nmids), last_error=None)
 
@@ -286,7 +295,9 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
                 continue
             dt_req = time.perf_counter() - t_req
             if status == 429:
-                print(f"[RATE-LIMIT] 429 限流，暂停 {RATE_LIMIT_PAUSE} 秒重试...")
+                base_interval = min(base_interval * BACKOFF_UP, BACKOFF_CAP)
+                clean_streak = 0
+                print(f"[RATE-LIMIT] 429 限流，间隔退避→{base_interval:.2f}s，暂停 {RATE_LIMIT_PAUSE} 秒重试...")
                 time.sleep(RATE_LIMIT_PAUSE)
                 query_count -= 1
                 continue
@@ -307,6 +318,12 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
                 continue
             consecutive_fail = 0
             server_fail = 0
+            # 闭环退避回收：每满 BACKOFF_CLEAN_STREAK 条干净就把 base 往下收一点（到 floor 为止）
+            clean_streak += 1
+            if clean_streak >= BACKOFF_CLEAN_STREAK:
+                clean_streak = 0
+                if base_interval > CALL_INTERVAL:
+                    base_interval = max(base_interval * BACKOFF_DOWN, CALL_INTERVAL)
 
             try:
                 resp = json.loads(text)
@@ -325,9 +342,9 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
             idx += 1
             processed_index = idx
             if idx % 50 == 0 or idx == len(nmids):
-                print(f"[PROGRESS] {idx}/{len(nmids)} 已查询, 命中 {matched_count}")
+                print(f"[PROGRESS] {idx}/{len(nmids)} 已查询, 命中 {matched_count}, 间隔 {base_interval:.2f}s")
                 _prog(status="running", processed_index=idx, total=len(nmids),
-                      matched=matched_count, last_error=None)
+                      matched=matched_count, interval=round(base_interval, 2), last_error=None)
 
             # 满 SHARD_SIZE 写分片
             if len(buffer) >= SHARD_SIZE:
@@ -338,8 +355,9 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
                 save_state(run_dir, run_ts, shard_index, query_count,
                            matched_count, processed_index)
 
-            # 自适应睡眠：把“请求发起间隔”钉在 CALL_INTERVAL——慢请求少睡/不睡，快请求补足余量
-            time.sleep(max(0.0, CALL_INTERVAL - dt_req))
+            # 自适应睡眠：把“请求发起间隔”钉在 base_interval（闭环退避动态值，floor=CALL_INTERVAL）
+            # ——慢请求少睡/不睡，快请求补足余量；撞 429 时 base 抬高把 surge 摁住
+            time.sleep(max(0.0, base_interval - dt_req))
 
         finished = idx >= len(nmids) and not _stopped()
         result["finished"] = finished
