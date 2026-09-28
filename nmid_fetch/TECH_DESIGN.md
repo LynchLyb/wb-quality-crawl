@@ -86,14 +86,14 @@ nm_id
 ```
 
 - 只有一列 `nm_id`，每行一个 nmID
-- 文件名 = `<WB 数字卖家 ID>_treatment_002.csv`（如 `250149024_treatment_002.csv`）；只消费 treatment_002 变体
+- 文件名 = `<WB 数字卖家 ID>_treatment_002.csv`（如 `25014****_treatment_002.csv`）；只消费 treatment_002 变体
 
 ### 店铺映射
 
 CSV 文件名（店铺 ID）→ 反查 `config.json` → 得到 `store1`/`store2`：
 
 ```json
-{"store1": 250132124, "store2": 250149024}
+{"store1": 25013****, "store2": 25014****}
 ```
 
 ---
@@ -194,7 +194,7 @@ while True:  # 常驻循环
 ```json
 {
   "task_id": "task_001",
-  "store_id": "250132124",
+  "store_id": "25013****",
   "run_ts": "20260918_120000",
   "shard_index": 3,
   "query_count": 4500,
@@ -237,7 +237,7 @@ while True:  # 常驻循环
 ### 8.7 下载过滤（只处理已配置的两店）
 
 - 每轮实时列 OSS：`list_task_ids()` 取 `content-opt-pool/` 一级目录；`list_store_csvs(tid)` 只列 `<sellerId>_treatment_002.csv`（control/treatment_001/manifest.json 等直接忽略）
-- 从文件名解析出 WB 数字 sellerId；`store_id_for_seller()` 按 `config.json` 反查店铺（当前仅 store1=250132124、store2=250149024）
+- 从文件名解析出 WB 数字 sellerId；`store_id_for_seller()` 按 `config.json` 反查店铺（当前仅 store1=25013****、store2=25014****）
 - **非这两个店铺**（sellerId 不在 config.json）：打印 `[WARN] sellerId=… 未在 config.json 配置，跳过`，**不下载、不处理**，继续下一个 CSV
 - 店铺锁被其他进程占用：本轮跳过该 CSV，下一轮重试
 - 因此在 OSS 增删 CSV 只影响"本轮跑哪些店"；未配置店铺的文件永远不会被拉取到本地

@@ -146,7 +146,7 @@ Enable-ScheduledTask  -TaskName 'WB_FetchHost'   # 维护完：恢复登录自�
 
 多店可能共用同一登录子账号，且不同店在下拉框里**显示名可能完全相同**，靠肉眼/名字无法区分。`fetch_all.py` 在 `driver.get(PAGE_URL)` 之后、**捕获 tableListv6 请求之前**先自动把下拉框切到 `config.json` 指定的店（切换会改供应商 cookie/token 上下文，必须在捕获前完成，否则重放的是旧店请求）：
 
-- `config.json`（项目根）登记每店期望的 WB 数字卖家 ID：`{"store1": 250132124, "store2": 250149024}`；`config.get_seller_id(id)` 读取。
+- `config.json`（项目根）登记每店期望的 WB 数字卖家 ID：`{"store1": 25013****, "store2": 25014****}`（示例已脱敏）；`config.get_seller_id(id)` 读取。
 - `ensure_selected_store(driver, expected_id)`：JS `.click()` 点开 chip（`[data-testid="desktop-profile-select-button-chips-component"]`；普通 click 展不开），轮询等 `input[type=radio][name=supplier]`，遍历每 `<li>` 取 `[data-name="Text"]` 文本、从 "ID <数字> • 税号 <数字>" 解析数字 ID。返回 `already`（当前 checked 即目标，不点击）/`switched`（点击目标行 radio 切换）/`not_found`（下拉框无此店）/`click_failed`/`open_failed`。
 - `switched` 后：`time.sleep(3)` 等切换落地 → `driver.get_log("performance")` 丢弃旧店请求日志 → `driver.get(PAGE_URL)` 干净重载 → 再 `wait_first_request` 捕获目标店请求 → `verify_selected_store` 只读复核 checked==目标。
 - 结果码：`not_found`→`store_not_available`，复核不符→`store_mismatch`，展不开/读不到→`store_verify_failed`，均 `driver.quit()` 退出且**巡检不自动重启**（需人工确认店铺）。未配置该店 ID→跳过选店并提示补上（向后兼容）。

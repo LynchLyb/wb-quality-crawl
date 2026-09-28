@@ -62,7 +62,7 @@ def list_store_csvs(task_id, bucket=None):
 
     只认 <sellerId>_<INPUT_VARIANT>.csv（默认 <sellerId>_treatment_002.csv）；
     _control / _treatment_001 / 纯 <sellerId>.csv 等一律忽略。
-    seller_id = 变体后缀之前的 WB 数字卖家 ID（250149024_treatment_002.csv → 250149024）。
+    seller_id = 变体后缀之前的 WB 数字卖家 ID（25014****_treatment_002.csv → 25014****，示例已脱敏）。
     """
     if bucket is None:
         bucket, err = get_bucket()

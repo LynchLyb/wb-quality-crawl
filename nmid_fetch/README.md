@@ -32,7 +32,7 @@
 
 ## 配置
 
-- 店铺映射：复用根目录 `config.json`（`{"store1": 250132124, ...}`）
+- 店铺映射：复用根目录 `config.json`（`{"store1": 25013****, ...}`，示例已脱敏）
 - OSS 凭据：复用根目录 `oss_config.json`
 - 输入路径：`content-opt-pool/{taskId}/{sellerId}_treatment_002.csv`（只消费 treatment_002 变体，忽略 _control/_treatment_001）
 - 输出路径：`wildberries/wbRatingData/{oss_segment}/json/{日期}/{taskId}_{storeId}_shard_{NNN}_{run_ts}.json`

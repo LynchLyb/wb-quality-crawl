@@ -39,7 +39,7 @@ copy config.json.example config.json
 copy oss_config.json.example oss_config.json
 ```
 
-- `config.json`：每店 WB **数字卖家 ID**，如 `{"store1":250132124,"store2":250149024}`，用于抓取前自动选店。ID 在 WB 后台店铺切换下拉框 “ID <数字>” 处读取。
+- `config.json`：每店 WB **数字卖家 ID**，如 `{"store1":25013****,"store2":25014****}`（示例已脱敏），用于抓取前自动选店。ID 在 WB 后台店铺切换下拉框 “ID <数字>” 处读取。
 - `oss_config.json`：`access_key_id` / `access_key_secret` / `endpoint` / `bucket` / `region`（`region` 供 OSS **AuthV4** 签名）。可先用 `oss_conn_test.py` 自检连通性与权限。
 
 **④ 每店首次人工登录**（DPAPI 决定无法自动；生成该机专属 profile）

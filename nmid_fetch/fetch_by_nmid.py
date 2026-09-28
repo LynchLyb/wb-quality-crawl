@@ -406,7 +406,7 @@ def process_task(store, task_id, seller_id, resume=True, stop_event=None, progre
     if target_key is None:
         print(f"[ERROR] taskId={task_id} 下找不到 sellerId={seller_id} 的 CSV")
         return {"finished": False, "error": "csv_not_found"}
-    # 下载后保留 OSS 原文件名（如 250149024_treatment_002.csv），便于在 nmid_data 下直接辨认最新输入
+    # 下载后保留 OSS 原文件名（如 25014****_treatment_002.csv，示例已脱敏），便于在 nmid_data 下直接辨认最新输入
     local_csv = os.path.join(_run_dir(store_id, task_id), os.path.basename(target_key))
     ok, err = oss_input.download_csv(target_key, local_csv)
     if not ok:

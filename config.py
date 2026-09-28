@@ -108,7 +108,7 @@ def enabled_stores():
 
 
 # ---------------------------------------------------------------- 店铺校验用卖家 ID
-# config.json: {"store1": 250132124, "store2": 250149024}
+# config.json: {"store1": 25013****, "store2": 25014****}（示例已脱敏，真实值仅存生产机本地 config.json）
 # 抓取前用它校验页面下拉框选中的店铺，防止登录错账号、爬错店数据。
 SELLER_ID_FILE = os.path.join(BASE_DIR, "config.json")
 
