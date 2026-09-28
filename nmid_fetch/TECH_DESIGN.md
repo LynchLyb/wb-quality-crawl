@@ -55,7 +55,7 @@ nmid_data/
 ├── control_done.json           # control 台账：{store_id: {OSS key: {name, last_modified, finished_at, ...}}} 每店多条、每份一条
 ├── store1/
 │   ├── <taskId>/               # treatment_001 工作目录（布局不变）
-│   │   ├── <卖家ID>_treatment_001.csv      # 输入保留 OSS 原名，同名覆盖（如 250132124_treatment_001.csv）
+│   │   ├── <卖家ID>_treatment_001.csv      # 输入保留 OSS 原名，同名覆盖（如 25013****_treatment_001.csv）
 │   │   ├── <taskId>_<卖家ID>_treatment_001_shard_NNN_<run_ts>.json   # treatment 分片（带全 _treatment_001 标记）
 │   │   ├── csv/
 │   │   │   └── <taskId>_<卖家ID>_treatment_001_shard_NNN_<run_ts>.csv
@@ -63,7 +63,7 @@ nmid_data/
 │   │   └── summary_treatment.json  # treatment 汇总
 │   ├── control/
 │   │   └── <taskId>/           # control 独立工作目录（与 treatment 分离）
-│   │       ├── <卖家ID>_control.csv        # 如 250132124_control.csv，同名覆盖
+│   │       ├── <卖家ID>_control.csv        # 如 25013****_control.csv，同名覆盖
 │   │       ├── <taskId>_<卖家ID>_control_shard_NNN_<run_ts>.json
 │   │       ├── csv/
 │   │       │   └── <taskId>_<卖家ID>_control_shard_NNN_<run_ts>.csv
@@ -74,13 +74,13 @@ nmid_data/
     └── ...
 ```
 
-实义示例（taskId=`7ea403`、卖家 `250149024` → store2，首片、运行始于 2026-09-28 10:15:00）：
+实义示例（taskId=`7ea403`、卖家 `25014****` → store2，首片、运行始于 2026-09-28 10:15:00）：
 
 ```
-nmid_data/store2/7ea403/250149024_treatment_001.csv                        # 输入（001）
-nmid_data/store2/7ea403/7ea403_250149024_treatment_001_shard_000_20260928_101500.json
-nmid_data/store2/control/7ea403/250149024_control.csv                      # 输入（control）
-nmid_data/store2/control/7ea403/7ea403_250149024_control_shard_000_20260928_101500.json
+nmid_data/store2/7ea403/25014****_treatment_001.csv                        # 输入（001）
+nmid_data/store2/7ea403/7ea403_25014****_treatment_001_shard_000_20260928_101500.json
+nmid_data/store2/control/7ea403/25014****_control.csv                      # 输入（control）
+nmid_data/store2/control/7ea403/7ea403_25014****_control_shard_000_20260928_101500.json
 ```
 
 上传成功后分片 JSON/CSV 从本地删除（与旧行为一致）；`state_<tag>.json` / `summary_<tag>.json` / 台账保留。
@@ -132,14 +132,14 @@ nm_id
 ```
 
 - 只有一列 `nm_id`，每行一个 nmID
-- 文件名前缀 = WB 数字卖家 ID（如 `250149024_treatment_001.csv`）
+- 文件名前缀 = WB 数字卖家 ID（如 `25014****_treatment_001.csv`）
 
 ### 店铺映射
 
 文件名里的卖家 ID → 反查 `config.json` → 得到 `store1`/`store2`：
 
 ```json
-{"store1": 250132124, "store2": 250149024}
+{"store1": 25013****, "store2": 25014****}
 ```
 
 ---
@@ -188,8 +188,8 @@ while True:  # 常驻循环
     ├─ 过滤 control：台账里 key+mtime 相同的已跑过 → 剔除（连下载都不发生）
     ├─ jobs 为空 / 剔完为空（无符合规则的输入 + control 全部已记账）→ 置 idle，睡 60s（可被 /stop 打断）后重查
     ├─ 下载阶段（轮初一次性拉取本轮全部输入，日志 [DL]）：
-    │   ├─ control → nmid_data/<store>/control/<taskId>/<原始文件名>（如 250149024_control.csv）
-    │   ├─ treatment_001 → nmid_data/<store>/<taskId>/<原始文件名>（如 250149024_treatment_001.csv）
+    │   ├─ control → nmid_data/<store>/control/<taskId>/<原始文件名>（如 25014****_control.csv）
+    │   ├─ treatment_001 → nmid_data/<store>/<taskId>/<原始文件名>（如 25014****_treatment_001.csv）
     │   ├─ 保留 OSS 原名、同名覆盖；下载的输入文件一律不删除
     │   └─ 某份下载失败 → 该份本轮跳过执行，记本轮未完成
     ├─ 执行阶段（按队列顺序串行，control 先跑）：
@@ -248,7 +248,7 @@ while True:  # 常驻循环
 ```json
 {
   "task_id": "task_001",
-  "store_id": "250132124",
+  "store_id": "25013****",
   "run_ts": "20260918_120000",
   "shard_index": 3,
   "query_count": 4500,
@@ -292,7 +292,7 @@ while True:  # 常驻循环
 
 - 每轮一次 `plan_round(sellers=已配置卖家)`：内部 `list_task_ids()` 取 `content-opt-pool/` 一级目录，`list_input_csvs(tid)` 只列 `.csv` 后缀文件（manifest.json 等非 CSV 直接忽略）并解析出 variant / index / mtime
 - 纳入 `_treatment_001.csv`（每轮重复）与**全部** `_control.csv`（每上传一份都入队，上传时间序、control 排队首优先）；`_treatment_002+`、旧命名 `{sellerId}.csv`、命名不符的文件一律不入清单
-- 文件名前缀 = WB 数字 sellerId；`store_id_for_seller()` 按 `config.json` 反查店铺（当前仅 store1=250132124、store2=250149024）
+- 文件名前缀 = WB 数字 sellerId；`store_id_for_seller()` 按 `config.json` 反查店铺（当前仅 store1=25013****、store2=25014****）
 - **非这两个店铺**（sellerId 不在 config.json）：**不下载、不处理**；告警按轮聚合成一条
   `[WARN] 以下卖家未在 config.json 配置，本轮共跳过 N 个输入文件: …`（早期逐文件打印导致日志暴涨，已收敛）
 - 命名不符的文件同样每轮只汇总告警一次，并计入 `/status` 快照的 `skipped`

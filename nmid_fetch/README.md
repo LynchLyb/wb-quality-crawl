@@ -50,7 +50,7 @@
 
 ## 配置
 
-- 店铺映射：复用根目录 `config.json`（`{"store1": 250132124, ...}`），未配置卖家 ID 的店不跑
+- 店铺映射：复用根目录 `config.json`（`{"store1": 25013****, ...}`，示例已脱敏），未配置卖家 ID 的店不跑
 - OSS 凭据：复用根目录 `oss_config.json`
 - 输入路径：`content-opt-pool/{taskId}/{卖家ID}_treatment_{NNN}.csv`、`content-opt-pool/{taskId}/{卖家ID}_control.csv`
 - 本地目录：`nmid_data/{store_id}/{taskId}/`（扁平，无分类层）；同一 taskId 下 treatment_001 与最新 control 共用目录，输入保留 OSS 原名、分片带变体标记、断点/汇总带变体后缀（`state_<tag>.json`/`summary_<tag>.json`）；control 台账 `nmid_data/control_done.json`
