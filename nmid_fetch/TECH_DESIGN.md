@@ -10,10 +10,11 @@
 新增独立模块 `nmid_fetch/`，实现：
 
 - 常驻 Flask 服务，循环扫描 OSS `content-opt-pool/` 目录
-- 下载各 taskId 下的店铺 CSV（含 nmID 列表）
+- 按当前账号规则筛选输入文件：`{卖家ID}_treatment_001.csv` 每轮重复跑；`{卖家ID}_control.csv` 每个卖家只跑最新的一份
+- 下载 CSV（含 nmID 列表）
 - 对每个 nmID 调 `tableListv6` 接口（`filter.search = nmID`）查询商品数据
 - 每 2000 次查询写一个分片 JSON，异步转 CSV 并上传 OSS
-- 所有文件处理完立即开始下一轮循环
+- treatment 全部处理完立即开始下一轮循环；本轮没干活（无符合规则的输入 / control 已记账）则等待 60s
 - **不改动任何现有文件**
 - **旧模块继续跑全量，新旧模块通过外部协调器串行调度**
 
@@ -27,7 +28,9 @@
 | **最大复用** | 从现有模块导入通用函数（选店、捕获请求、调接口、限流处理、锁、OSS 上传等） |
 | **格式一致** | 输出分片 JSON 结构与现有 `tableListv6_shard_*.json` 兼容，直接复用 `wb_to_oss.py` 转换 |
 | **可续传** | 记录已处理 nmID 索引，崩溃后从断点继续 |
-| **循环处理** | 常驻服务，处理完所有 taskId 立即重新开始 |
+| **循环处理** | 常驻服务，treatment 处理完立即重新开始；无事可做时等待，不空转刷日志/OSS |
+| **变体隔离** | treatment / control 各自一个工作目录与分片名标记，共用 taskId 也不互相覆盖 |
+| **control 幂等** | control 跑完写台账（OSS key + mtime），只跑一次；仅当出现更新的文件时重跑 |
 | **串行调度** | 新模块与旧模块共用 Chrome profile，通过外部协调器时间片轮转，互不冲突 |
 
 ---
@@ -49,17 +52,25 @@ nmid_fetch/
 
 ```
 nmid_data/
+├── control_done.json           # control 台账：{store_id: {key, last_modified, finished_at, ...}}
 ├── store1/
-│   ├── <taskId>/
-│   │   ├── <taskId>_<storeId>_shard_NNN_<run_ts>.json
+│   ├── <taskId>/               # 扁平布局：同一 taskId 下 treatment_001 与最新 control 共用此目录
+│   │   ├── <卖家ID>_treatment_001.csv      # 输入保留 OSS 原名，同名覆盖
+│   │   ├── <卖家ID>_control.csv
+│   │   ├── <taskId>_<卖家ID>_shard_NNN_<run_ts>.json           # treatment 分片（无变体标记）
+│   │   ├── <taskId>_<卖家ID>_control_shard_NNN_<run_ts>.json   # control 分片（带 _control）
 │   │   ├── csv/
-│   │   │   └── <taskId>_<storeId>_shard_NNN_<run_ts>.csv
-│   │   ├── state.json          # 断点状态
-│   │   └── summary.json        # 汇总
-│   └── fetch_by_nmid.lock      # PID 锁
+│   │   │   └── <taskId>_<卖家ID>[_control]_shard_NNN_<run_ts>.csv
+│   │   ├── state_treatment.json    # treatment 断点（按变体区分，避免与 control 撞名）
+│   │   ├── summary_treatment.json  # treatment 汇总
+│   │   ├── state_control.json      # control 断点
+│   │   └── summary_control.json    # control 汇总
+│   └── fetch_by_nmid.lock      # PID 锁（店铺层）
 └── store2/
     └── ...
 ```
+
+上传成功后分片 JSON/CSV 从本地删除（与旧行为一致）；`state_<tag>.json` / `summary_<tag>.json` / 台账保留。
 
 ---
 
@@ -70,11 +81,34 @@ nmid_data/
 ```
 content-opt-pool/
 ├── <taskId_1>/
-│   ├── <storeId_1>.csv    ← store1 的 nmID 列表（文件名 = WB 数字卖家 ID）
-│   └── <storeId_2>.csv    ← store2 的 nmID 列表
+│   ├── <卖家ID_1>_treatment_001.csv   ← 实验组 001：跑
+│   ├── <卖家ID_1>_treatment_002.csv   ← 实验组 002+：不跑
+│   ├── <卖家ID_1>_control.csv         ← 对照组：只跑最新的一份
+│   └── <卖家ID_2>_...csv
 ├── <taskId_2>/
 │   └── ...
 ```
+
+### 命名解析（`oss_input.parse_csv_name`）
+
+| 文件名 | variant | index | 是否跑 |
+|---|---|---|---|
+| `<卖家ID>_treatment_001.csv` | `treatment` | 1 | ✅ 每轮重复 |
+| `<卖家ID>_treatment_002.csv` | `treatment` | 2 | ❌ 忽略 |
+| `<卖家ID>_control.csv` | `control` | - | ✅ 每卖家只跑最新一份，台账去重 |
+| `<卖家ID>.csv`（旧命名） | `legacy` | - | ❌ 忽略（仅 CLI 未指定变体时兜底） |
+| 其他 | `unknown` | - | ❌ 忽略，每轮汇总告警一次 |
+
+### 规则编排（`oss_input.plan_round`）
+
+一次 OSS 扫描给出本轮待跑清单：
+
+- `treatment`：每个 taskId 下编号 = `TREATMENT_INDEX`（1）的文件各一份；
+- `control`：**按卖家分组**各取 `last_modified` 最大的一份（`latest_control_per_seller`）；
+- `sellers` 参数限定只编排 `config.json` 里已配置的卖家，其余直接不入清单；
+- 返回 `(jobs, unknown_names)`，job 里带 `key/name/seller_id/variant/index/last_modified/task_id`。
+
+`control` 是否真的跑由宿主再查一次台账（`control_already_done`：key 与 mtime 均相同 → 跳过）。
 
 ### CSV 文件格式
 
@@ -85,11 +119,11 @@ nm_id
 ```
 
 - 只有一列 `nm_id`，每行一个 nmID
-- 文件名 = WB 数字卖家 ID（如 `250132124.csv`）
+- 文件名前缀 = WB 数字卖家 ID（如 `250149024_treatment_001.csv`）
 
 ### 店铺映射
 
-CSV 文件名（店铺 ID）→ 反查 `config.json` → 得到 `store1`/`store2`：
+文件名里的卖家 ID → 反查 `config.json` → 得到 `store1`/`store2`：
 
 ```json
 {"store1": 250132124, "store2": 250149024}
@@ -109,11 +143,14 @@ wildberries/wbRatingData/{oss_segment}/csv/{上传当天BJT日期}/{文件名}
 ### 文件名规则
 
 ```
-{taskId}_{storeId}_shard_{NNN}_{run_ts}.json
-{taskId}_{storeId}_shard_{NNN}_{run_ts}.csv
+{taskId}_{卖家ID}_shard_{NNN}_{run_ts}.json           # treatment_001（与历史产物一致）
+{taskId}_{卖家ID}_control_shard_{NNN}_{run_ts}.json    # control
 ```
 
 - `run_ts`：本次运行时间戳 `YYYYMMDD_HHMMSS`，每轮产生新文件，**不覆盖旧文件**
+- 变体标记取自下载的输入文件名（`oss_input.variant_tag`）：treatment 编号 1 不带标记，
+  control / treatment_002+ 带 `_control` / `_treatment_002`；CSV 与 JSON 同名只换后缀
+- 下游区分 treatment / control 数据看文件名里的 `_control` 标记
 
 ### 分片 JSON 格式
 
@@ -131,31 +168,33 @@ wildberries/wbRatingData/{oss_segment}/csv/{上传当天BJT日期}/{文件名}
 ## 6. 核心流程
 
 ```
-app_nmid.py 启动（Flask + waitress，端口 8081）
+app_nmid.py 启动（Flask + waitress，端口 8081；worker 由 /resume 或协调器拉起）
     │
     ▼
 while True:  # 常驻循环
-    ├─ list OSS content-opt-pool/ 下所有 taskId
-    ├─ 对每个 taskId：
-    │   ├─ list 该 taskId 下所有 *.csv
-    │   ├─ 对每个 CSV（文件名 = storeId）：
-    │   │   ├─ 反查 config.json → store_id
-    │   │   ├─ 下载 CSV → 解析 nm_id 列
-    │   │   ├─ 获取 PID 锁（nmid_data/<store>/fetch_by_nmid.lock）
-    │   │   ├─ 清理残留 Chrome → 启动 Chrome → 打开 WB 页面
-    │   │   ├─ 自动选店 + 复核 → 捕获首条 tableListv6 请求
-    │   │   ├─ 读取断点 state.json → 恢复已处理索引
-    │   │   ├─ 对每个 nmID（从断点开始）：
-    │   │   │   ├─ 构造请求体：filter.search = nmID
-    │   │   │   ├─ 调 tableListv6（call_api）
-    │   │   │   ├─ 未命中 → 直接丢弃
-    │   │   │   ├─ 命中 → 加入 buffer
-    │   │   │   ├─ 每 2000 次查询 → 写分片 → 异步转 CSV + 上传 OSS
-    │   │   │   └─ 更新 state.json
-    │   │   ├─ 写 summary.json → 释放锁 → 关闭 Chrome
-    │   └─ 该 taskId 全部店铺处理完
-    ├─ 所有 taskId 处理完
-    └─ 立即开始下一轮（不 sleep）
+    ├─ plan_round（一次 OSS 扫描）→ 本轮待跑清单 jobs + 不符合命名的告警
+    ├─ jobs 为空 → 置 idle，睡 60s（可被 /stop 打断）后重查
+    ├─ 过滤 control：台账里 key+mtime 相同的已跑过 → 剔除
+    │   └─ 剔完为空（treatment 本轮已完成 + control 已记账）→ 睡 60s 后重查
+    ├─ 对每个待跑 job：
+    │   ├─ 反查 config.json → store_id（未配置的卖家每轮汇总告警一次）
+    │   ├─ 获取 PID 锁（nmid_data/<store>/fetch_by_nmid.lock）
+    │   ├─ 下载 CSV 到 <store>/<taskId>/<原始文件名>.csv（如 250149024_treatment_001.csv，同名覆盖）→ 解析 nm_id 列
+    │   ├─ 清理残留 Chrome → 启动 Chrome → 打开 WB 页面
+    │   ├─ 自动选店 + 复核 → 捕获首条 tableListv6 请求
+    │   ├─ 读取断点 state_<tag>.json（tag=treatment|control）→ 恢复已处理索引
+    │   ├─ 对每个 nmID（从断点开始）：
+    │   │   ├─ 构造请求体：filter.search = nmID
+    │   │   ├─ 调 tableListv6（call_api）
+    │   │   ├─ 未命中 → 直接丢弃
+    │   │   ├─ 命中 → 加入 buffer
+    │   │   ├─ 每 2000 次查询 → 写分片 → 异步转 CSV + 上传 OSS
+    │   │   └─ 更新 state_<tag>.json
+    │   ├─ 写 summary_<tag>.json；若是 control 且 finished → 写 control_done.json 台账
+    │   └─ 释放锁 → 关闭 Chrome
+    ├─ 整轮一个任务也没执行（如锁被占）→ 睡 60s 后重试，不空转
+    └─ 全部 finished → 只重置 **treatment** 的断点，立即开始下一轮
+        （control 不重置：它只跑一次，出现更新的文件时自然重跑）
 ```
 
 ---
@@ -188,7 +227,7 @@ while True:  # 常驻循环
 
 ### 8.2 断点续传
 
-`state.json`：
+`state_<tag>.json`（tag=treatment|control，扁平布局下按变体区分避免撞名）：
 
 ```json
 {
@@ -224,22 +263,35 @@ while True:  # 常驻循环
 ### 8.5 未命中处理
 
 - 查询返回空 cards → **直接丢弃**，不记录、不重试
-- `summary.json` 记录 `query_count` / `matched_count` / `missed_count`
+- `summary_<tag>.json` 记录 `query_count` / `matched_count` / `missed_count`
 
 ### 8.6 数据安全（暂停不丢失）
 
 - stop 时 `finally` 块把 buffer 剩余数据写入分片
-- stop 时保存 `state.json` 断点
+- stop 时保存 `state_<tag>.json` 断点
 - stop 时等待所有异步上传线程完成（`join(timeout=30)`）
 - resume 时从 `processed_index` 继续，不重复查询
 
-### 8.7 下载过滤（只处理已配置的两店）
+### 8.7 下载过滤（只处理已配置的两店 + 只处理规则内的变体）
 
-- 每轮实时列 OSS：`list_task_ids()` 取 `content-opt-pool/` 一级目录；`list_store_csvs(tid)` 只列 `.csv` 后缀文件（manifest.json 等非 CSV 直接忽略）
-- CSV 文件名 = WB 数字 sellerId；`store_id_for_seller()` 按 `config.json` 反查店铺（当前仅 store1=250132124、store2=250149024）
-- **非这两个店铺**（sellerId 不在 config.json）：打印 `[WARN] sellerId=… 未在 config.json 配置，跳过`，**不下载、不处理**，继续下一个 CSV
-- 店铺锁被其他进程占用：本轮跳过该 CSV，下一轮重试
-- 因此在 OSS 增删 CSV 只影响"本轮跑哪些店"；未配置店铺的文件永远不会被拉取到本地
+- 每轮一次 `plan_round(sellers=已配置卖家)`：内部 `list_task_ids()` 取 `content-opt-pool/` 一级目录，`list_input_csvs(tid)` 只列 `.csv` 后缀文件（manifest.json 等非 CSV 直接忽略）并解析出 variant / index / mtime
+- 只纳入 `_treatment_001.csv`（每轮重复）与每个卖家 `last_modified` 最新的一份 `_control.csv`；`_treatment_002+`、旧命名 `{sellerId}.csv`、命名不符的文件一律不入清单
+- 文件名前缀 = WB 数字 sellerId；`store_id_for_seller()` 按 `config.json` 反查店铺（当前仅 store1=250132124、store2=250149024）
+- **非这两个店铺**（sellerId 不在 config.json）：**不下载、不处理**；告警按轮聚合成一条
+  `[WARN] 以下卖家未在 config.json 配置，本轮共跳过 N 个输入文件: …`（早期逐文件打印导致日志暴涨，已收敛）
+- 命名不符的文件同样每轮只汇总告警一次，并计入 `/status` 快照的 `skipped`
+- 店铺锁被其他进程占用：本轮跳过该 job，睡 60s 后重试（整轮没执行任何任务时不空转）
+- 因此在 OSS 增删 CSV 只影响"本轮跑哪些文件"；未配置店铺 / 规则外变体的文件永远不会被拉取到本地
+
+### 8.8 control 去重与台账
+
+- 台账文件 `nmid_data/control_done.json`：`{store_id: {key, name, task_id, seller_id, last_modified, finished_at, query_count, matched_count, run_dir}}`
+- **只在 `finished=True` 时记账**：中途 stop / 崩溃 / 限流退出不写台账，下次从 `<taskId>/state_control.json` 断点接着跑完再记
+- 跳过判据 `control_already_done()`：台账里的 `key` 与 `last_modified` 与本轮最新 control **均相同** → 跳过；
+  同名文件在 OSS 上被覆盖（mtime 变化）或换了 taskId → 视为"更新的数据"，重跑一次
+- 空 CSV（无 nmID）也算跑完并记账，避免每轮重复下载
+- 写入用临时文件 + `os.replace`，避免半截 JSON；读失败（损坏/不存在）当空台账处理
+- `reset_state_for_new_round` 只对 treatment 的 run_dir 调用，control 断点不会被重置
 
 ---
 

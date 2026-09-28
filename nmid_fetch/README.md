@@ -2,40 +2,60 @@
 
 ## 功能
 
-常驻 Flask 服务，循环扫描 OSS `content-opt-pool/` 目录：
+常驻 Flask 服务，循环扫描 OSS `content-opt-pool/` 目录，**按当前账号规则**只跑两类输入文件：
 
-1. 发现所有 `taskId/店铺ID.csv` 文件
+1. 发现 `{taskId}/{卖家ID}_treatment_001.csv`（实验组，每轮重复跑）与 `{卖家ID}_control.csv`（对照组，每个卖家只跑最新的一份）
 2. 下载 CSV，解析 `nm_id` 列
 3. 对每个 nmID 调 `tableListv6` 接口（`filter.search = nmID`）
 4. 每 2000 次查询写一个分片 JSON
 5. 异步转 CSV 并上传 OSS
-6. 所有文件处理完立即开始下一轮
+6. treatment 全部跑完立即重置断点开始下一轮；本轮没干活（无数据 / control 已记账）则等 60s 再查
+
+不跑的输入：`treatment_002` 及以后编号、旧命名 `{卖家ID}.csv`、`config.json` 未配置的卖家。
+
+**control 只跑一次**：跑完写入台账 `nmid_data/control_done.json`（记 OSS key + 文件 mtime）；
+下轮只有当该卖家出现**更新的** control 文件（同名覆盖使 mtime 变化，或换了 taskId）才会重跑一次。
+中途停止不记账，下次从断点接着跑完。
+
+**输出按下载的输入文件名区分**：`treatment_001` 的分片名不带变体标记（与历史产物一致），
+`control` 的分片名带 `_control`，两者落在同一 taskId 的不同子目录，不会互相覆盖。
 
 ## 文件说明
 
 | 文件 | 作用 |
 |---|---|
 | `__init__.py` | 包标识 |
-| `fetch_by_nmid.py` | 主脚本：常驻循环 + 按 nmID 查询 + 分片上传 |
-| `oss_input.py` | OSS 输入文件扫描/下载 |
+| `fetch_by_nmid.py` | 主脚本：按 nmID 查询 + 分片上传 + control 台账 |
+| `oss_input.py` | OSS 输入文件扫描/命名解析/规则编排（`plan_round`）/下载 |
 | `app_nmid.py` | Flask 宿主入口（可选，或直接跑 fetch_by_nmid.py） |
 
 ## 运行
 
 ```powershell
-# 启动常驻服务
-.venv\Scripts\python.exe -u nmid_fetch/fetch_by_nmid.py
+# 常驻宿主（生产方式，端口 8081；启动后 worker 不自起，需 POST /resume 或由协调器拉起）
+.venv\Scripts\python.exe -m nmid_fetch.app_nmid
 
-# 或指定店铺
-.venv\Scripts\python.exe -u nmid_fetch/fetch_by_nmid.py --store store1
+# 单次跑一轮（同一套规则，调试用）
+.venv\Scripts\python.exe -m nmid_fetch.fetch_by_nmid --resume
+
+# 只跑指定店 / 指定 taskId
+.venv\Scripts\python.exe -m nmid_fetch.fetch_by_nmid --store store2 --task-id aer-20260925-bc0715 --resume
+
+# 只查本轮会跑哪些文件（不下载、不开浏览器）
+.venv\Scripts\python.exe -m nmid_fetch.oss_input
 ```
+
+运维接口：`GET /health`、`GET /status`（含 `pending_task_count`、`control_ledger`、`skipped`）、
+`POST /stop`（当前查询周期后优雅退出并落盘断点）、`POST /resume`。
 
 ## 配置
 
-- 店铺映射：复用根目录 `config.json`（`{"store1": 250132124, ...}`）
+- 店铺映射：复用根目录 `config.json`（`{"store1": 250132124, ...}`），未配置卖家 ID 的店不跑
 - OSS 凭据：复用根目录 `oss_config.json`
-- 输入路径：`content-opt-pool/{taskId}/{storeId}.csv`
-- 输出路径：`wildberries/wbRatingData/{oss_segment}/json/{日期}/{taskId}_{storeId}_shard_{NNN}_{run_ts}.json`
+- 输入路径：`content-opt-pool/{taskId}/{卖家ID}_treatment_{NNN}.csv`、`content-opt-pool/{taskId}/{卖家ID}_control.csv`
+- 本地目录：`nmid_data/{store_id}/{taskId}/`（扁平，无分类层）；同一 taskId 下 treatment_001 与最新 control 共用目录，输入保留 OSS 原名、分片带变体标记、断点/汇总带变体后缀（`state_<tag>.json`/`summary_<tag>.json`）；control 台账 `nmid_data/control_done.json`
+- 输出路径：`wildberries/wbRatingData/{oss_segment}/json/{日期}/{taskId}_{卖家ID}[_control]_shard_{NNN}_{run_ts}.json`
+  （CSV 同名同规则落 `.../csv/{日期}/`）
 
 ## 抓取速率与日产量（间隔 1.6s = 实测最优）
 
@@ -329,4 +349,6 @@
 
 - **效率**：单店串行稳态 ~22 条/分（≈3 万条/天）；20 万 nmID 约需 6-7 天/店铺，多店并行可线性缩短
 - **分片大小**：2000 次查询一个分片，崩溃最多丢 2000 次结果
-- **重复处理**：每轮重新下载 CSV，全量重新查询，OSS 文件名含时间戳不覆盖
+- **重复处理**：treatment 每轮重新下载 CSV、全量重新查询，OSS 文件名含时间戳不覆盖；control 靠台账只跑一次
+- **control 重跑条件**：仅当 OSS 上出现更新的 `_control.csv`（同名覆盖使 mtime 变化，或新 taskId）；如需强制重跑，删掉 `nmid_data/control_done.json` 里对应店铺的条目（或整个文件）
+- **日志**：`nmid_data/app_nmid.log` 启动时降级为 `.old`（只留一代）；空轮已改为睡 60s，不会再出现日志暴涨

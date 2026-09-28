@@ -26,6 +26,7 @@ state.json
 # ---- 抓取数据与分片输出（体积大，属产物非源码）----
 data/
 tableListv6_*/
+nmid_data/
 nmID.txt
 
 # ---- 日志 ----

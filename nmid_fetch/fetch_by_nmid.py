@@ -2,17 +2,23 @@
 """按 nmID 集合抓取 WB 商品数据（核心逻辑）。
 
 流程:
-    1. 从 OSS content-opt-pool/<taskId>/<sellerId>.csv 下载 nmID 列表
+    1. 从 OSS content-opt-pool/<taskId>/<sellerId>_{treatment_NNN|control}.csv 下载 nmID 列表
     2. 启动 Chrome（复用该店 profile）→ 选店 → 捕获首条 tableListv6 请求
     3. 对每个 nmID，把捕获请求体的 filter.search 替换为该 nmID 后重放
     4. 命中(有 cards)加入 buffer，未命中直接丢弃
     5. 每 SHARD_SIZE 次查询写一个分片，异步转 CSV 上传 OSS
-    6. state.json 记录 processed_index，崩溃/停止后 --resume 从断点继续
+    6. state_<tag>.json 记录 processed_index，崩溃/停止后 --resume 从断点继续
 
 与旧模块 fetch_all 的区别:
     - 旧模块翻页拉全量（cursor 推进）；本模块按 nmID 单条查询（filter.search）
     - 旧模块 SHARD_SIZE=100 / CALL_INTERVAL=1.2；本模块 2000 / 1.5（限流 60s40 次）
-    - 本模块数据目录 nmid_data/<store>/<taskId>/，与旧模块隔离
+    - 本模块数据目录 nmid_data/<store>/<taskId>/（扁平，无分类层），与旧模块隔离
+
+变体规则（与 oss_input.plan_round 一致）:
+    - treatment 只跑编号 001，每轮重复；control 每卖家只跑最新的一份，跑完记台账不再重复
+    - 同 taskId 下 treatment / control 共用一个目录，靠文件名区分互不覆盖：
+      输入 CSV 保留 OSS 原名、分片名带变体标记、断点/汇总带变体后缀
+      （state_<tag>.json / summary_<tag>.json，tag=treatment|control）
 """
 import argparse
 import json
@@ -51,8 +57,14 @@ BACKOFF_UP = 1.5            # 撞 429 的放大系数（1.6×1.5=2.4，一次即
 BACKOFF_DOWN = 0.95         # 每满一个干净窗口的回收系数
 BACKOFF_CLEAN_STREAK = 50   # 触发一次回收所需的连续干净条数
 
-# 数据根目录：nmid_data/<store_id>/<task_id>/
+# 数据根目录：nmid_data/<store_id>/<task_id>/（扁平，无分类层）
+#   treatment_001 每轮全量重跑；control 每卖家只抓最新一份、台账去重。
+#   两类落在同一 taskId 目录下，靠文件名区分：输入用 OSS 原名、分片带变体标记、
+#   断点/汇总带变体后缀（state_<tag>.json / summary_<tag>.json），互不覆盖。
 DATA_ROOT = os.path.join(config.BASE_DIR, "nmid_data")
+
+# control 台账：记住每个店已跑完的 control 输入文件，下次只跑更新的
+CONTROL_LEDGER = os.path.join(DATA_ROOT, "control_done.json")
 
 
 def _store_dir(store_id):
@@ -60,10 +72,21 @@ def _store_dir(store_id):
 
 
 def _lock_file(store_id):
-    return os.path.join(_store_dir(store_id), "fetch_by_nmid.lock")
+    # 锁文件写在店目录顶层；先确保目录存在，否则 acquire_single_instance 写入会因
+    # 父目录缺失而失败（锁静默失效，无法拦新旧模块抢同一店 profile）。
+    d = _store_dir(store_id)
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "fetch_by_nmid.lock")
 
 
-def _run_dir(store_id, task_id):
+def _run_dir(store_id, task_id, variant=None, index=None):
+    """一次抓取的工作目录：nmid_data/<store>/<task_id>/（扁平，无分类层）。
+
+    同一 taskId 下 treatment_001 与最新 control 共用此目录，靠文件名区分：输入 CSV
+    保留 OSS 原名、分片名带变体标记、断点/汇总带变体后缀（state_<tag>.json /
+    summary_<tag>.json），互不覆盖。variant/index 仅供调用方推导这些文件名，不参与
+    目录层级。
+    """
     return os.path.join(_store_dir(store_id), task_id)
 
 
@@ -76,8 +99,19 @@ def store_id_for_seller(seller_id):
 
 
 # ---------------------------------------------------------------- 断点状态
+def _state_path(run_dir, tag=None):
+    """断点文件路径：扁平布局下同 taskId 的 treatment/control 共用目录，故按变体
+    区分文件名（state_treatment.json / state_control.json），tag 缺省退回 state.json。"""
+    return os.path.join(run_dir, f"state_{tag}.json" if tag else "state.json")
+
+
+def _summary_path(run_dir, tag=None):
+    """汇总文件路径：同 state，按变体区分避免 treatment/control 互相覆盖。"""
+    return os.path.join(run_dir, f"summary_{tag}.json" if tag else "summary.json")
+
+
 def save_state(run_dir, run_ts, shard_index, query_count, matched_count,
-               processed_index, finished=False):
+               processed_index, finished=False, tag=None):
     state = {
         "run_ts": run_ts,
         "shard_index": shard_index,
@@ -87,12 +121,12 @@ def save_state(run_dir, run_ts, shard_index, query_count, matched_count,
         "finished": finished,
     }
     os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, "state.json"), "w", encoding="utf-8") as f:
+    with open(_state_path(run_dir, tag), "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def load_state(run_dir):
-    p = os.path.join(run_dir, "state.json")
+def load_state(run_dir, tag=None):
+    p = _state_path(run_dir, tag)
     if not os.path.exists(p):
         return None
     try:
@@ -102,9 +136,9 @@ def load_state(run_dir):
         return None
 
 
-def reset_state_for_new_round(run_dir):
+def reset_state_for_new_round(run_dir, tag=None):
     """一轮跑完后重置断点，让下一轮从头查询（每次全量处理）。"""
-    st = load_state(run_dir)
+    st = load_state(run_dir, tag)
     if st is None:
         return
     st["finished"] = False
@@ -112,14 +146,77 @@ def reset_state_for_new_round(run_dir):
     st["query_count"] = 0
     st["matched_count"] = 0
     st["shard_index"] = 1
-    with open(os.path.join(run_dir, "state.json"), "w", encoding="utf-8") as f:
+    with open(_state_path(run_dir, tag), "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=2)
 
 
+# ---------------------------------------------------------------- control 台账
+def load_control_ledger():
+    """读 control 台账：{store_id: {key, task_id, seller_id, last_modified, ...}}。"""
+    if not os.path.exists(CONTROL_LEDGER):
+        return {}
+    try:
+        with open(CONTROL_LEDGER, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_control_ledger_entry(store_id, row, extra=None):
+    """control 跑完后记账；先写临时文件再 replace，避免半截 JSON。"""
+    ledger = load_control_ledger()
+    entry = {
+        "key": row.get("key"),
+        "name": row.get("name"),
+        "task_id": row.get("task_id"),
+        "seller_id": row.get("seller_id"),
+        "last_modified": row.get("last_modified"),
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if extra:
+        entry.update(extra)
+    ledger[store_id] = entry
+    os.makedirs(os.path.dirname(CONTROL_LEDGER), exist_ok=True)
+    tmp = CONTROL_LEDGER + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ledger, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONTROL_LEDGER)
+    return entry
+
+
+def control_already_done(store_id, row):
+    """这份 control 是否已跑过（台账里同一个 OSS key 即视为跑过）。
+
+    只比 key 不比 last_modified：OSS 上覆盖同名文件后 key 不变但 mtime 变，
+    此时按"最新数据"重跑一次，跑完台账刷新 mtime。
+    """
+    entry = load_control_ledger().get(store_id)
+    if not entry:
+        return False
+    return entry.get("key") == row.get("key") \
+        and entry.get("last_modified") == row.get("last_modified")
+
+
+def mark_control_done(store_id, row, result):
+    """control 跑完（finished）后写台账。"""
+    return save_control_ledger_entry(store_id, row, extra={
+        "query_count": result.get("query_count", 0),
+        "matched_count": result.get("matched_count", 0),
+        "run_dir": result.get("out_dir"),
+    })
+
+
 # ---------------------------------------------------------------- 分片与上传
-def flush_shard(buffer, shard_index, run_ts, task_id, seller_id, out_dir):
-    """写分片文件，文件名 {taskId}_{sellerId}_shard_NNN_{run_ts}.json。"""
-    name = f"{task_id}_{seller_id}_shard_{shard_index:03d}_{run_ts}.json"
+def flush_shard(buffer, shard_index, run_ts, task_id, seller_id, out_dir,
+                variant=None, index=None):
+    """写分片文件，文件名 {taskId}_{sellerId}[_{variant}]_shard_NNN_{run_ts}.json。
+
+    treatment_001 不带标记（与历史产物一致），control / treatment_002+ 带上变体名。
+    """
+    tag = oss_input.variant_tag(variant, index) if variant else None
+    mid = f"_{tag}" if tag and tag != "treatment" else ""
+    name = f"{task_id}_{seller_id}{mid}_shard_{shard_index:03d}_{run_ts}.json"
     path = os.path.join(out_dir, name)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(buffer, f, ensure_ascii=False)
@@ -150,17 +247,20 @@ def _shard_worker(run_dir, path, bucket, prefix):
 
 # ---------------------------------------------------------------- 主流程
 def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
-                   stop_event=None, progress=None):
+                   stop_event=None, progress=None, variant=None, index=None):
     """对单个 (store, task_id, seller_id, nmids) 执行按 nmID 查询。
 
     store: 已解析店铺 dict；nmids: nmID 字符串列表。
-    返回 dict: {finished, query_count, matched_count, out_dir, error}
+    variant/index: 输入文件变体（treatment/control 与编号）。用于推导分片名与断点/
+                   汇总文件的变体后缀（tag），不再决定目录层级（布局扁平）。
+    返回 dict: {finished, query_count, matched_count, out_dir, variant, error}
     """
     store_id = store["id"]
-    run_dir = _run_dir(store_id, task_id)
+    tag = oss_input.variant_tag(variant, index) if variant else None
+    run_dir = _run_dir(store_id, task_id, variant, index)
     os.makedirs(run_dir, exist_ok=True)
     result = {"finished": False, "query_count": 0, "matched_count": 0,
-              "out_dir": run_dir, "error": None}
+              "out_dir": run_dir, "variant": variant, "error": None}
 
     def _prog(**kw):
         if progress is None:
@@ -180,7 +280,7 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
     shard_index = 1
     query_count = 0
     matched_count = 0
-    st = load_state(run_dir) if resume else None
+    st = load_state(run_dir, tag) if resume else None
     if st and not st.get("finished"):
         run_ts = st.get("run_ts", run_ts)
         processed_index = st.get("processed_index", 0)
@@ -349,11 +449,12 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
             # 满 SHARD_SIZE 写分片
             if len(buffer) >= SHARD_SIZE:
                 shard_index, spath = flush_shard(
-                    buffer, shard_index, run_ts, task_id, seller_id, run_dir)
+                    buffer, shard_index, run_ts, task_id, seller_id, run_dir,
+                    variant, index)
                 buffer = []
                 on_shard_written(spath)
                 save_state(run_dir, run_ts, shard_index, query_count,
-                           matched_count, processed_index)
+                           matched_count, processed_index, tag=tag)
 
             # 自适应睡眠：把“请求发起间隔”钉在 base_interval（闭环退避动态值，floor=CALL_INTERVAL）
             # ——慢请求少睡/不睡，快请求补足余量；撞 429 时 base 抬高把 surge 摁住
@@ -368,19 +469,21 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
         # 剩余 buffer 写入分片（即使不满 SHARD_SIZE）
         if buffer:
             shard_index, spath = flush_shard(
-                buffer, shard_index, run_ts, task_id, seller_id, run_dir)
+                buffer, shard_index, run_ts, task_id, seller_id, run_dir,
+                variant, index)
             on_shard_written(spath)
         save_state(run_dir, run_ts, shard_index, query_count, matched_count,
-                   processed_index, finished=result["finished"])
+                   processed_index, finished=result["finished"], tag=tag)
         # 写汇总
         summary = {
             "task_id": task_id, "seller_id": seller_id, "store_id": store_id,
+            "variant": variant, "index": index,
             "run_ts": run_ts, "total_nmids": len(nmids),
             "query_count": query_count, "matched_count": matched_count,
             "missed_count": query_count - matched_count,
             "finished": result["finished"],
         }
-        with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
+        with open(_summary_path(run_dir, tag), "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         # 等待上传线程完成，避免暂停丢失
         for t in upload_threads:
@@ -394,29 +497,65 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
     return result
 
 
-def process_task(store, task_id, seller_id, resume=True, stop_event=None, progress=None):
-    """下载 CSV → 解析 nmID → 执行查询。返回 run_nmid_fetch 的结果。"""
+def process_task(store, task_id, seller_id, resume=True, stop_event=None, progress=None,
+                 variant=None, index=None, oss_key=None, row=None):
+    """下载 CSV → 解析 nmID → 执行查询；control 跑完写台账。返回 run_nmid_fetch 的结果。
+
+    oss_key: 直接指定输入文件（宿主按 plan_round 编排时用）；缺省则按 (卖家, 变体) 在
+             该 taskId 下自己找。row: plan_round 给出的输入行，用于 control 台账记录。
+    """
     store_id = store["id"]
-    csvs = oss_input.list_store_csvs(task_id)
-    target_key = None
-    for key, sid in csvs:
-        if sid == str(seller_id):
-            target_key = key
-            break
+    tag = oss_input.variant_tag(variant, index) if variant else "input"
+    run_dir = _run_dir(store_id, task_id, variant, index)
+    target_key = oss_key
     if target_key is None:
-        print(f"[ERROR] taskId={task_id} 下找不到 sellerId={seller_id} 的 CSV")
-        return {"finished": False, "error": "csv_not_found"}
-    local_csv = os.path.join(_run_dir(store_id, task_id), f"input_{seller_id}.csv")
+        rows = oss_input.list_input_csvs(task_id)
+        for r in rows:
+            if r["seller_id"] != str(seller_id):
+                continue
+            if variant is None or (r["variant"] == variant and
+                                   (index is None or r["index"] == index)):
+                target_key = r["key"]
+                row = row or r
+                break
+        # 旧命名 <sellerId>.csv 兜底（仅在未指定变体时）
+        if target_key is None and variant is None:
+            for r in rows:
+                if r["seller_id"] == str(seller_id) and r["variant"] == "legacy":
+                    target_key, row = r["key"], r
+                    break
+    if target_key is None:
+        print(f"[ERROR] taskId={task_id} 下找不到 sellerId={seller_id} 的 {tag} CSV")
+        return {"finished": False, "variant": variant, "error": "csv_not_found"}
+    os.makedirs(run_dir, exist_ok=True)
+    # 保持 OSS 原始文件名（如 250149024_treatment_001.csv），同名覆盖
+    fname = (row or {}).get("name") or (os.path.basename(target_key) if target_key else None) \
+        or f"{seller_id}_{tag}.csv"
+    local_csv = os.path.join(run_dir, fname)
     ok, err = oss_input.download_csv(target_key, local_csv)
     if not ok:
         print(f"[ERROR] 下载 CSV 失败: {err}")
-        return {"finished": False, "error": f"download_failed: {err}"}
+        return {"finished": False, "variant": variant, "error": f"download_failed: {err}"}
     nmids = oss_input.parse_nmids(local_csv)
-    print(f"[INPUT] taskId={task_id} sellerId={seller_id} 共 {len(nmids)} 个 nmID")
+    print(f"[INPUT] taskId={task_id} sellerId={seller_id} {tag} 共 {len(nmids)} 个 nmID")
     if not nmids:
-        return {"finished": True, "error": "empty_csv"}
-    return run_nmid_fetch(store, task_id, seller_id, nmids,
-                          resume=resume, stop_event=stop_event, progress=progress)
+        # 空文件也算跑完：control 记账，避免每轮重复下载
+        if variant == "control":
+            mark_control_done(store_id, row or {"key": target_key, "task_id": task_id,
+                                                "seller_id": str(seller_id)},
+                              {"query_count": 0, "matched_count": 0, "run_dir": run_dir})
+        return {"finished": True, "variant": variant, "out_dir": run_dir,
+                "query_count": 0, "matched_count": 0, "error": "empty_csv"}
+    result = run_nmid_fetch(store, task_id, seller_id, nmids,
+                            resume=resume, stop_event=stop_event, progress=progress,
+                            variant=variant, index=index)
+    # control 只跑一次：完整跑完才记账，中途中断下次接着跑
+    if variant == "control" and result.get("finished"):
+        entry = mark_control_done(store_id, row or {"key": target_key, "task_id": task_id,
+                                                   "seller_id": str(seller_id)}, result)
+        print(f"[CONTROL] 已记入台账，后续只跑比它更新的输入: {entry['key']} "
+              f"mtime={entry.get('last_modified')}")
+    return result
 
 
 def main():
@@ -426,27 +565,34 @@ def main():
     ap.add_argument("--resume", action="store_true", help="从断点续传")
     args = ap.parse_args()
 
-    task_ids = [args.task_id] if args.task_id else oss_input.list_task_ids()
-    if not task_ids:
-        print("[ERROR] content-opt-pool 下无 taskId")
+    sellers = [config.get_seller_id(s["id"]) for s in config.STORES]
+    sellers = [s for s in sellers if s]
+    task_ids = [args.task_id] if args.task_id else None
+    # 与常驻宿主走同一套规则：treatment_001 每轮跑 + 每卖家最新的一份 control
+    jobs, unknown = oss_input.plan_round(task_ids=task_ids, sellers=sellers)
+    if unknown:
+        print(f"[WARN] 文件名不符合命名规则，已忽略: {sorted(unknown)}")
+    if not jobs:
+        print("[ERROR] content-opt-pool 下没有符合规则的输入文件")
         return
-    for tid in task_ids:
-        for key, seller_id in oss_input.list_store_csvs(tid):
-            store_id = store_id_for_seller(seller_id)
-            if store_id is None:
-                print(f"[WARN] sellerId={seller_id} 未在 config.json 配置，跳过")
-                continue
-            if args.store and store_id != args.store:
-                continue
-            store = config.get_store(store_id)
-            lock = _lock_file(store_id)
-            if not acquire_single_instance(lock):
-                print(f"[LOCK] {store_id} 已被其他进程占用，跳过")
-                continue
-            try:
-                process_task(store, tid, seller_id, resume=args.resume)
-            finally:
-                release_single_instance(lock)
+    for job in jobs:
+        store_id = store_id_for_seller(job["seller_id"])
+        if store_id is None:
+            print(f"[WARN] sellerId={job['seller_id']} 未在 config.json 配置，跳过")
+            continue
+        if args.store and store_id != args.store:
+            continue
+        store = config.get_store(store_id)
+        lock = _lock_file(store_id)
+        if not acquire_single_instance(lock):
+            print(f"[LOCK] {store_id} 已被其他进程占用，跳过")
+            continue
+        try:
+            process_task(store, job["task_id"], job["seller_id"], resume=args.resume,
+                         variant=job["variant"], index=job["index"],
+                         oss_key=job["key"], row=job)
+        finally:
+            release_single_instance(lock)
 
 
 if __name__ == "__main__":

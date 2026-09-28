@@ -12,6 +12,9 @@
     - 新模块窗口内未跑完 → 第二天窗口从断点继续
 
 守护:
+    - 单实例守卫：2 分钟重复触发与人工 Start-ScheduledTask 可能同一瞬间各起一个实例
+      （IgnoreNew 与 PID 锁文件在这种竞态下都拦不住），改用 OS 级回环端口独占绑定，
+      拿不到端口的实例直接退出
     - 切换失败重试 3 次；停止超时则放弃本次切换（避免 profile 冲突）
     - 停止等待超时 180s（覆盖旧模块首捕 120s + 限流暂停 30s 的最坏优雅停止耗时）
     - 新模块窗口内每分钟补发旧模块 /stop，防旧宿主 AUTO_START/崩溃重启复活 worker
@@ -27,6 +30,8 @@ import sys
 import time
 import urllib.request
 from datetime import datetime
+
+from nmid_fetch.singleton import single_instance_or_exit
 
 OLD_MODULE = "http://127.0.0.1:8080"   # 旧模块 app.py
 NEW_MODULE = "http://127.0.0.1:8081"   # 新模块 app_nmid.py
@@ -125,6 +130,37 @@ def _worker_alive(base_url):
     return False
 
 
+def _host_reachable(base_url):
+    """宿主进程是否在线（/health 可达）。
+
+    区分“宿主根本没起”与“宿主在线但 worker 空闲”：前者无 profile 冲突风险，
+    切换时可直接略过“停对方”；后者才需要确保其 worker 真的停下来。
+    """
+    return _http_get_json(f"{base_url}/health") is not None
+
+
+def _stop_counterpart(base_url, label):
+    """切换前停掉对方。返回 True=可安全起我方（对方已停/不在线）；False=对方在跑却停不下来。
+
+    对方宿主不可达 → 无争用风险，直接放行（修复：旧宿主未启动时新模块永远无法被拉起）。
+    对方在线但 worker 空闲 → 无需停，放行。
+    对方在线且 worker 在跑 → 发 /stop 并等待；停不下来则返回 False（避免 profile 冲突）。
+    """
+    if not _host_reachable(base_url):
+        _log(f"[协调器] {label}不可达（未启动），无 profile 冲突，直接切换")
+        return True
+    if not _worker_alive(base_url):
+        _log(f"[协调器] {label}在线但 worker 未跑，无需停止")
+        return True
+    if not _http_post(f"{base_url}/stop?store=all"):
+        _log(f"[协调器] {label} /stop 调用失败")
+        return False
+    if not wait_worker_stopped(base_url):
+        _log(f"[协调器] {label}超时未停止，放弃本次切换（避免 profile 冲突）")
+        return False
+    return True
+
+
 def wait_worker_stopped(base_url, timeout=STOP_WAIT_TIMEOUT):
     """轮询 /status 直到 worker_alive=false，最多等 timeout 秒。"""
     deadline = time.time() + timeout
@@ -144,34 +180,25 @@ def _pending_new_tasks():
 
 
 def switch_to_new():
-    """停旧 → 起新；任一步失败返回 False（停止超时不强行 resume）。"""
+    """停旧 → 起新。旧宿主已停/不可达视为无冲突，直接起新；仅“旧在跑却停不下来”才放弃。"""
     _log("[协调器] 停止旧模块 → 启动新模块")
-    if not _http_post(f"{OLD_MODULE}/stop?store=all"):
-        _log("[协调器] 旧模块 /stop 调用失败")
-        _record_switch("OLD->NEW", False, "old /stop failed")
-        return False
-    if not wait_worker_stopped(OLD_MODULE):
-        _log("[协调器] 旧模块超时未停止，放弃本次切换（避免 profile 冲突）")
-        _record_switch("OLD->NEW", False, "old stop timeout")
+    if not _stop_counterpart(OLD_MODULE, "旧模块"):
+        _record_switch("OLD->NEW", False, "old not stopped")
         return False
     if not _http_post(f"{NEW_MODULE}/resume"):
         _log("[协调器] 新模块 /resume 调用失败")
         _record_switch("OLD->NEW", False, "new /resume failed")
         return False
-    _record_switch("OLD->NEW", True, "new window 00:00-12:00")
+    _record_switch("OLD->NEW", True,
+                   f"new window {NEW_START_HOUR:02d}:00-{NEW_START_HOUR + NEW_HOURS:02d}:00")
     return True
 
 
 def switch_to_old():
-    """停新 → 起旧；任一步失败返回 False（停止超时不强行 resume）。"""
+    """停新 → 起旧。新宿主已停/不可达视为无冲突，直接起旧；仅“新在跑却停不下来”才放弃。"""
     _log("[协调器] 停止新模块 → 启动旧模块")
-    if not _http_post(f"{NEW_MODULE}/stop"):
-        _log("[协调器] 新模块 /stop 调用失败")
-        _record_switch("NEW->OLD", False, "new /stop failed")
-        return False
-    if not wait_worker_stopped(NEW_MODULE):
-        _log("[协调器] 新模块超时未停止，放弃本次切换（避免 profile 冲突）")
-        _record_switch("NEW->OLD", False, "new stop timeout")
+    if not _stop_counterpart(NEW_MODULE, "新模块"):
+        _record_switch("NEW->OLD", False, "new not stopped")
         return False
     if not _http_post(f"{OLD_MODULE}/resume?store=all"):
         _log("[协调器] 旧模块 /resume 调用失败")
@@ -198,6 +225,14 @@ def _in_new_window(now):
 
 
 def main():
+    # 单实例守卫：计划任务 2 分钟重复触发与人工 Start-ScheduledTask 可能同瞬间各起
+    # 一个实例（IgnoreNew 与 PID 锁文件都拦不住），改用 OS 级独占绑定保证。
+    with single_instance_or_exit("coordinator", log=_log):
+        _run()
+    return 0
+
+
+def _run():
     _log(f"[协调器] 启动：天级轮转，新模块每天 {NEW_START_HOUR:02d}:00-"
          f"{NEW_START_HOUR + NEW_HOURS:02d}:00（{NEW_HOURS}h），"
          f"旧模块其余 {24 - NEW_HOURS}h")
@@ -236,4 +271,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
