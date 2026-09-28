@@ -24,7 +24,7 @@ import config
 from nmid_fetch import oss_input
 from nmid_fetch.singleton import single_instance_or_exit
 from nmid_fetch.fetch_by_nmid import (
-    _lock_file, _run_dir, control_already_done, load_control_ledger,
+    _lock_file, _run_dir, control_already_done, download_input, load_control_ledger,
     process_task, reset_state_for_new_round, store_id_for_seller,
 )
 from fetch_all import acquire_single_instance, release_single_instance
@@ -107,7 +107,8 @@ def _plan_jobs():
 
 
 def _main_loop():
-    """常驻循环：按规则跑 treatment_001（每轮重复）+ control（只跑最新、台账去重）。"""
+    """常驻循环：按规则跑 treatment_001（每轮重复）+ control（每上传一份只跑一次、
+    台账去重、单独存放且跑过不再下载）。"""
     while not _stop_event.is_set():
         jobs, skipped = _plan_jobs()
         if not jobs:
@@ -120,13 +121,18 @@ def _main_loop():
 
         todo = []
         for j in jobs:
-            # control 只跑一次：台账里同一份（key+mtime）就跳过，有更新的才重跑
+            # control 每份只跑一次：台账里同一份（key+mtime）就跳过（不再下载）；
+            # 同名覆盖 mtime 变化视为新的一份，会再跑
             if j["variant"] == "control" and control_already_done(j["store_id"], j):
                 continue
             todo.append(j)
         if not todo:
             ledger = load_control_ledger()
-            done_desc = ", ".join(f"{k}:{v.get('name')}" for k, v in sorted(ledger.items()))
+            done_desc = ", ".join(
+                f"{sid}/{e.get('name')}"
+                for sid, entries in sorted(ledger.items())
+                for e in sorted(entries.values(),
+                                key=lambda x: x.get("last_modified") or 0))
             print(f"[IDLE] treatment 本轮已完成、control 已记账（{done_desc}），"
                   f"{IDLE_SLEEP}s 后重查")
             if not _sleep_idle(IDLE_SLEEP, "all_done",
@@ -136,12 +142,29 @@ def _main_loop():
 
         print(f"[ROUND] 本轮待跑 {len(todo)} 个输入文件: "
               + ", ".join(f"{j['task_id']}/{j['name']}" for j in todo))
-        round_done = True
-        worked = False
-        treatments = []
+        # 下载阶段：本轮输入一次性全部拉取落盘（treatment_001 + 未记账 control），再排队跑
+        queue = []
         for j in todo:
             if _stop_event.is_set():
                 return
+            store = config.get_store(j["store_id"])
+            local_csv, _row, err = download_input(
+                store, j["task_id"], j["seller_id"], variant=j["variant"],
+                index=j["index"], oss_key=j["key"], row=j)
+            if err:
+                print(f"[DL] {j['task_id']}/{j['name']} 下载失败，本轮跳过执行")
+            else:
+                print(f"[DL] {j['task_id']}/{j['name']} -> {local_csv}")
+            queue.append((j, local_csv))
+        round_done = True
+        worked = False
+        treatments = []
+        for j, local_csv in queue:
+            if _stop_event.is_set():
+                return
+            if local_csv is None:
+                round_done = False
+                continue
             store_id = j["store_id"]
             store = config.get_store(store_id)
             lock = _lock_file(store_id)
@@ -153,7 +176,7 @@ def _main_loop():
                 r = process_task(store, j["task_id"], j["seller_id"], resume=True,
                                  stop_event=_stop_event, progress=_progress,
                                  variant=j["variant"], index=j["index"],
-                                 oss_key=j["key"], row=j)
+                                 oss_key=j["key"], row=j, local_csv=local_csv)
                 worked = True
                 if not r.get("finished"):
                     round_done = False

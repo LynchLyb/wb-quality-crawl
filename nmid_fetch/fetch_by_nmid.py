@@ -63,7 +63,7 @@ BACKOFF_CLEAN_STREAK = 50   # 触发一次回收所需的连续干净条数
 #   断点/汇总带变体后缀（state_<tag>.json / summary_<tag>.json），互不覆盖。
 DATA_ROOT = os.path.join(config.BASE_DIR, "nmid_data")
 
-# control 台账：记住每个店已跑完的 control 输入文件，下次只跑更新的
+# control 台账：记住每个店已跑完的 control 输入文件（每店多条），跑过的不再下载不再跑
 CONTROL_LEDGER = os.path.join(DATA_ROOT, "control_done.json")
 
 
@@ -80,13 +80,16 @@ def _lock_file(store_id):
 
 
 def _run_dir(store_id, task_id, variant=None, index=None):
-    """一次抓取的工作目录：nmid_data/<store>/<task_id>/（扁平，无分类层）。
+    """一次抓取的工作目录。
 
-    同一 taskId 下 treatment_001 与最新 control 共用此目录，靠文件名区分：输入 CSV
-    保留 OSS 原名、分片名带变体标记、断点/汇总带变体后缀（state_<tag>.json /
-    summary_<tag>.json），互不覆盖。variant/index 仅供调用方推导这些文件名，不参与
-    目录层级。
+    treatment/legacy：nmid_data/<store>/<task_id>/（位置不变，每轮重跑的输入落这里）；
+    control：单独存放 nmid_data/<store>/control/<task_id>/，与每轮重跑的 treatment
+    输入隔离，跑过一次的靠台账跳过、不再下载。目录内产物靠文件名区分：输入 CSV 保留
+    OSS 原名、分片名带变体标记、断点/汇总带变体后缀（state_<tag>.json /
+    summary_<tag>.json），互不覆盖。
     """
+    if variant == "control":
+        return os.path.join(_store_dir(store_id), "control", task_id)
     return os.path.join(_store_dir(store_id), task_id)
 
 
@@ -152,19 +155,33 @@ def reset_state_for_new_round(run_dir, tag=None):
 
 # ---------------------------------------------------------------- control 台账
 def load_control_ledger():
-    """读 control 台账：{store_id: {key, task_id, seller_id, last_modified, ...}}。"""
+    """读 control 台账：{store_id: {oss_key: {key, name, last_modified, ...}}}。
+
+    兼容旧版单条台账（{store_id: {key, name, ...}}，每店只记最后跑的一份）：
+    读到旧结构时自动转成多条结构，已跑过的那份不会重跑。
+    """
     if not os.path.exists(CONTROL_LEDGER):
         return {}
     try:
         with open(CONTROL_LEDGER, encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    ledger = {}
+    for sid, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        if v.get("key") and v.get("finished_at"):
+            ledger[sid] = {v["key"]: v}          # 旧版：每店单条
+        else:
+            ledger[sid] = {k: e for k, e in v.items() if isinstance(e, dict)}
+    return ledger
 
 
 def save_control_ledger_entry(store_id, row, extra=None):
-    """control 跑完后记账；先写临时文件再 replace，避免半截 JSON。"""
+    """control 跑完后按 OSS key 记一条；先写临时文件再 replace，避免半截 JSON。"""
     ledger = load_control_ledger()
     entry = {
         "key": row.get("key"),
@@ -176,7 +193,7 @@ def save_control_ledger_entry(store_id, row, extra=None):
     }
     if extra:
         entry.update(extra)
-    ledger[store_id] = entry
+    ledger.setdefault(store_id, {})[row.get("key")] = entry
     os.makedirs(os.path.dirname(CONTROL_LEDGER), exist_ok=True)
     tmp = CONTROL_LEDGER + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -186,16 +203,15 @@ def save_control_ledger_entry(store_id, row, extra=None):
 
 
 def control_already_done(store_id, row):
-    """这份 control 是否已跑过（台账里同一个 OSS key 即视为跑过）。
+    """这份 control 是否已跑过（台账里同 OSS key 有条目且 mtime 一致即视为跑过）。
 
-    只比 key 不比 last_modified：OSS 上覆盖同名文件后 key 不变但 mtime 变，
-    此时按"最新数据"重跑一次，跑完台账刷新 mtime。
+    OSS 上覆盖同名文件后 key 不变但 mtime 变：视为新的一份，会再跑一次，
+    跑完台账刷新该 key 条目的 mtime。
     """
-    entry = load_control_ledger().get(store_id)
+    entry = load_control_ledger().get(store_id, {}).get(row.get("key"))
     if not entry:
         return False
-    return entry.get("key") == row.get("key") \
-        and entry.get("last_modified") == row.get("last_modified")
+    return entry.get("last_modified") == row.get("last_modified")
 
 
 def mark_control_done(store_id, row, result):
@@ -212,10 +228,17 @@ def flush_shard(buffer, shard_index, run_ts, task_id, seller_id, out_dir,
                 variant=None, index=None):
     """写分片文件，文件名 {taskId}_{sellerId}[_{variant}]_shard_NNN_{run_ts}.json。
 
-    treatment_001 不带标记（与历史产物一致），control / treatment_002+ 带上变体名。
+    变体标记带全：treatment 带完整编号（_treatment_001，与输入文件名对齐）、control
+    带 _control，OSS 上靠文件名即可区分 001 与 control；上传路径不变。legacy/未指定
+    变体不带标记。
     """
     tag = oss_input.variant_tag(variant, index) if variant else None
-    mid = f"_{tag}" if tag and tag != "treatment" else ""
+    if variant == "treatment":
+        mid = f"_treatment_{index:03d}" if index is not None else "_treatment"
+    elif tag:
+        mid = f"_{tag}"
+    else:
+        mid = ""
     name = f"{task_id}_{seller_id}{mid}_shard_{shard_index:03d}_{run_ts}.json"
     path = os.path.join(out_dir, name)
     with open(path, "w", encoding="utf-8") as f:
@@ -497,12 +520,11 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
     return result
 
 
-def process_task(store, task_id, seller_id, resume=True, stop_event=None, progress=None,
-                 variant=None, index=None, oss_key=None, row=None):
-    """下载 CSV → 解析 nmID → 执行查询；control 跑完写台账。返回 run_nmid_fetch 的结果。
+def download_input(store, task_id, seller_id, variant=None, index=None, oss_key=None, row=None):
+    """下载输入 CSV 到工作目录（control 落 control/ 子目录），保留 OSS 原文件名同名覆盖。
 
-    oss_key: 直接指定输入文件（宿主按 plan_round 编排时用）；缺省则按 (卖家, 变体) 在
-             该 taskId 下自己找。row: plan_round 给出的输入行，用于 control 台账记录。
+    返回 (local_path, row, None)；失败返回 (None, row, 错误码)。
+    oss_key 缺省时按 (卖家, 变体) 在该 taskId 下自己找；旧命名兜底仅在未指定变体时。
     """
     store_id = store["id"]
     tag = oss_input.variant_tag(variant, index) if variant else "input"
@@ -515,10 +537,8 @@ def process_task(store, task_id, seller_id, resume=True, stop_event=None, progre
                 continue
             if variant is None or (r["variant"] == variant and
                                    (index is None or r["index"] == index)):
-                target_key = r["key"]
-                row = row or r
+                target_key, row = r["key"], row or r
                 break
-        # 旧命名 <sellerId>.csv 兜底（仅在未指定变体时）
         if target_key is None and variant is None:
             for r in rows:
                 if r["seller_id"] == str(seller_id) and r["variant"] == "legacy":
@@ -526,16 +546,33 @@ def process_task(store, task_id, seller_id, resume=True, stop_event=None, progre
                     break
     if target_key is None:
         print(f"[ERROR] taskId={task_id} 下找不到 sellerId={seller_id} 的 {tag} CSV")
-        return {"finished": False, "variant": variant, "error": "csv_not_found"}
+        return None, row, "csv_not_found"
     os.makedirs(run_dir, exist_ok=True)
-    # 保持 OSS 原始文件名（如 250149024_treatment_001.csv），同名覆盖
-    fname = (row or {}).get("name") or (os.path.basename(target_key) if target_key else None) \
+    fname = (row or {}).get("name") or os.path.basename(target_key) \
         or f"{seller_id}_{tag}.csv"
     local_csv = os.path.join(run_dir, fname)
     ok, err = oss_input.download_csv(target_key, local_csv)
     if not ok:
         print(f"[ERROR] 下载 CSV 失败: {err}")
-        return {"finished": False, "variant": variant, "error": f"download_failed: {err}"}
+        return None, row, f"download_failed: {err}"
+    return local_csv, row, None
+
+
+def process_task(store, task_id, seller_id, resume=True, stop_event=None, progress=None,
+                 variant=None, index=None, oss_key=None, row=None, local_csv=None):
+    """解析 nmID → 执行查询；control 跑完写台账。返回 run_nmid_fetch 的结果。
+
+    local_csv: 调用方已提前下载好的输入路径（宿主轮初批量下载后传入）；缺省时本函数
+    自行下载（CLI 单次跑路径）。row: plan_round 给出的输入行，用于 control 台账记录。
+    """
+    store_id = store["id"]
+    tag = oss_input.variant_tag(variant, index) if variant else "input"
+    run_dir = _run_dir(store_id, task_id, variant, index)
+    if local_csv is None:
+        local_csv, row, err = download_input(store, task_id, seller_id, variant=variant,
+                                             index=index, oss_key=oss_key, row=row)
+        if not local_csv:
+            return {"finished": False, "variant": variant, "error": err}
     nmids = oss_input.parse_nmids(local_csv)
     print(f"[INPUT] taskId={task_id} sellerId={seller_id} {tag} 共 {len(nmids)} 个 nmID")
     if not nmids:

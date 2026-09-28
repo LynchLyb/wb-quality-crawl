@@ -135,8 +135,9 @@ def plan_round(task_ids=None, bucket=None, sellers=None):
 
     返回 (jobs, unknown_names):
         jobs = [{task_id, key, name, seller_id, variant, index, last_modified}, ...]
-               treatment_001 每个 taskId 一份（每轮重复跑）；
-               control 按卖家各取 last_modified 最新的一份（跑过由调用方查台账跳过）。
+               control 每上传一份都入队（按上传时间序）且排在队首优先跑，每份只跑
+               一次，跑过与否由调用方查台账跳过；其后是 treatment_001 每个 taskId
+               一份（每轮重复跑）。
         unknown_names = 文件名不符合任何已知命名的 CSV 名字集合（供一次性告警）。
     """
     if bucket is None:
@@ -159,9 +160,11 @@ def plan_round(task_ids=None, bucket=None, sellers=None):
                 treatments.append(r)
             elif r["variant"] == "control":
                 controls.append(r)
-    jobs = [dict(r, task_id=tid_of_key(r["key"])) for r in treatments]
-    for latest in latest_control_per_seller(controls).values():
-        jobs.append(dict(latest, task_id=tid_of_key(latest["key"])))
+    # control 插队在 treatment 之前：每上传一份都入队（上传时间序），每份只跑一次，
+    # 由调用方查台账跳过已跑的；control 队列清空后才轮到每轮重跑的 treatment_001
+    jobs = [dict(row, task_id=tid_of_key(row["key"]))
+            for row in sorted(controls, key=lambda r: (r["last_modified"], r["key"]))]
+    jobs += [dict(r, task_id=tid_of_key(r["key"])) for r in treatments]
     return jobs, unknown
 
 
@@ -169,26 +172,6 @@ def tid_of_key(oss_key):
     """从 OSS key 反推 taskId：content-opt-pool/<taskId>/<name>.csv。"""
     parts = oss_key.split("/")
     return parts[-2] if len(parts) >= 2 else ""
-
-
-def latest_control_per_seller(controls=None, task_ids=None, bucket=None):
-    """每个卖家各挑出 last_modified 最新的一份 control。返回 {seller_id: row}。"""
-    if controls is None:
-        if bucket is None:
-            bucket, err = get_bucket()
-            if err:
-                print(f"[OSS-INPUT] 获取 bucket 失败: {err}")
-                return {}
-        if task_ids is None:
-            task_ids = list_task_ids(bucket)
-        controls = [r for tid in task_ids for r in list_input_csvs(tid, bucket)
-                    if r["variant"] == "control"]
-    latest = {}
-    for r in controls:
-        cur = latest.get(r["seller_id"])
-        if cur is None or (r["last_modified"], r["key"]) > (cur["last_modified"], cur["key"]):
-            latest[r["seller_id"]] = r
-    return latest
 
 
 def download_csv(oss_key, local_path, bucket=None):
