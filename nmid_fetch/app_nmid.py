@@ -80,6 +80,9 @@ def _main_loop():
                 if store_id is None:
                     print(f"[WARN] sellerId={seller_id} 未在 config.json 配置，跳过")
                     continue
+                if not config.is_store_enabled(store_id):
+                    print(f"[WARN] sellerId={seller_id} -> {store_id} 在本机被 config.local.json 禁用，跳过")
+                    continue
                 store = config.get_store(store_id)
                 lock = _lock_file(store_id)
                 if not acquire_single_instance(lock):
@@ -103,7 +106,7 @@ def _main_loop():
             for tid in task_ids:
                 for _key, seller_id in oss_input.list_store_csvs(tid):
                     sid = store_id_for_seller(seller_id)
-                    if sid:
+                    if sid and config.is_store_enabled(sid):
                         reset_state_for_new_round(_run_dir(sid, tid))
         # round_done=False 时（有任务未完成/被跳过）也立即重试下一轮
 

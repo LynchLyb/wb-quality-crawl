@@ -70,8 +70,9 @@ nmid_data/
 ```
 content-opt-pool/
 ├── <taskId_1>/
-│   ├── <storeId_1>.csv    ← store1 的 nmID 列表（文件名 = WB 数字卖家 ID）
-│   └── <storeId_2>.csv    ← store2 的 nmID 列表
+│   ├── <sellerId>_control.csv         ← A/B 对照组，忽略
+│   ├── <sellerId>_treatment_001.csv   ← 实验组 001，忽略
+│   └── <sellerId>_treatment_002.csv   ← 唯一消费（sellerId = WB 数字卖家 ID）
 ├── <taskId_2>/
 │   └── ...
 ```
@@ -85,7 +86,7 @@ nm_id
 ```
 
 - 只有一列 `nm_id`，每行一个 nmID
-- 文件名 = WB 数字卖家 ID（如 `250132124.csv`）
+- 文件名 = `<WB 数字卖家 ID>_treatment_002.csv`（如 `250149024_treatment_002.csv`）；只消费 treatment_002 变体
 
 ### 店铺映射
 
@@ -235,8 +236,8 @@ while True:  # 常驻循环
 
 ### 8.7 下载过滤（只处理已配置的两店）
 
-- 每轮实时列 OSS：`list_task_ids()` 取 `content-opt-pool/` 一级目录；`list_store_csvs(tid)` 只列 `.csv` 后缀文件（manifest.json 等非 CSV 直接忽略）
-- CSV 文件名 = WB 数字 sellerId；`store_id_for_seller()` 按 `config.json` 反查店铺（当前仅 store1=250132124、store2=250149024）
+- 每轮实时列 OSS：`list_task_ids()` 取 `content-opt-pool/` 一级目录；`list_store_csvs(tid)` 只列 `<sellerId>_treatment_002.csv`（control/treatment_001/manifest.json 等直接忽略）
+- 从文件名解析出 WB 数字 sellerId；`store_id_for_seller()` 按 `config.json` 反查店铺（当前仅 store1=250132124、store2=250149024）
 - **非这两个店铺**（sellerId 不在 config.json）：打印 `[WARN] sellerId=… 未在 config.json 配置，跳过`，**不下载、不处理**，继续下一个 CSV
 - 店铺锁被其他进程占用：本轮跳过该 CSV，下一轮重试
 - 因此在 OSS 增删 CSV 只影响"本轮跑哪些店"；未配置店铺的文件永远不会被拉取到本地

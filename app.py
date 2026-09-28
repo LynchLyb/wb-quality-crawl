@@ -24,10 +24,14 @@ app = Flask(__name__)
 
 
 def _build_supervisors():
-    """每店一个 FetchSupervisor（解析一次 store 配置，带各自的 auto_start）。"""
+    """每个【本机启用】的店一个 FetchSupervisor（解析一次 store 配置，带各自的 auto_start）。
+
+    走 config.enabled_stores()：已按本机私有 config.local.json 的 disabled_stores 过滤，被禁用的店
+    （如本机的 store2）根本不建 supervisor —— 不自动跑、/status 不列、/start?store=all 也跳过。
+    没有 config.local.json 的机器 => 不过滤 => 行为与从前完全一致（向后兼容）。
+    """
     sups = {}
-    for s in config.STORES:
-        st = config.resolve_store(s)
+    for st in config.enabled_stores():
         sups[st["id"]] = FetchSupervisor(st, config.CRON_EXPR, st["auto_start"])
     return sups
 

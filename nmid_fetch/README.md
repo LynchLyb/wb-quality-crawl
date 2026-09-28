@@ -4,7 +4,7 @@
 
 常驻 Flask 服务，循环扫描 OSS `content-opt-pool/` 目录：
 
-1. 发现所有 `taskId/店铺ID.csv` 文件
+1. 发现所有 `taskId/<sellerId>_treatment_002.csv` 文件（只消费 treatment_002 变体）
 2. 下载 CSV，解析 `nm_id` 列
 3. 对每个 nmID 调 `tableListv6` 接口（`filter.search = nmID`）
 4. 每 2000 次查询写一个分片 JSON
@@ -34,7 +34,7 @@
 
 - 店铺映射：复用根目录 `config.json`（`{"store1": 250132124, ...}`）
 - OSS 凭据：复用根目录 `oss_config.json`
-- 输入路径：`content-opt-pool/{taskId}/{storeId}.csv`
+- 输入路径：`content-opt-pool/{taskId}/{sellerId}_treatment_002.csv`（只消费 treatment_002 变体，忽略 _control/_treatment_001）
 - 输出路径：`wildberries/wbRatingData/{oss_segment}/json/{日期}/{taskId}_{storeId}_shard_{NNN}_{run_ts}.json`
 
 ## 抓取速率与日产量（间隔 1.6s = 实测最优）

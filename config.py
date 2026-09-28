@@ -71,6 +71,42 @@ def all_stores():
     return [resolve_store(s) for s in STORES]
 
 
+# ---------------------------------------------------------------- 本机私有覆盖（不发布）
+# config.local.json（gitignore，仅本机）：按机器裁剪实际要跑的店，不动共享的 STORES 默认，
+# 因此对其他机器完全兼容。形如 {"disabled_stores": ["store2"]}：列出的店在本机被彻底排除
+# （宿主不建其 supervisor、/status 不列、/start?store=all 也跳过）。没有此文件的机器 =>
+# 覆盖为空 => 行为与从前完全一致。与 config.json / oss_config.json 同一套“结构进 git、
+# 环境相关留本地”约定（另配 config.local.json.example 模板）。
+LOCAL_OVERRIDE_FILE = os.path.join(BASE_DIR, "config.local.json")
+
+
+def _load_local_override():
+    try:
+        with open(LOCAL_OVERRIDE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def disabled_stores():
+    """本机禁用的店铺 id 集合（config.local.json 的 disabled_stores）；无文件/无该键则空集。"""
+    raw = _load_local_override().get("disabled_stores") or []
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {str(x).strip() for x in raw if str(x).strip()}
+
+
+def is_store_enabled(store_id):
+    """该店在本机是否启用（未被 config.local.json 的 disabled_stores 排除）。"""
+    return store_id not in disabled_stores()
+
+
+def enabled_stores():
+    """本机启用的店铺（已解析）列表：all_stores() 去掉 disabled_stores，顺序同 STORES。"""
+    return [s for s in all_stores() if is_store_enabled(s["id"])]
+
+
 # ---------------------------------------------------------------- 店铺校验用卖家 ID
 # config.json: {"store1": 250132124, "store2": 250149024}
 # 抓取前用它校验页面下拉框选中的店铺，防止登录错账号、爬错店数据。

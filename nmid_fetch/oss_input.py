@@ -4,10 +4,13 @@
 输入源约定（bucket 根目录下）:
     content-opt-pool/
     ├── <taskId>/
-    │   ├── <storeId>.csv     ← 文件名 = WB 数字卖家 ID
+    │   ├── <sellerId>_control.csv         ← A/B 对照组，忽略
+    │   ├── <sellerId>_treatment_001.csv   ← 实验组 001，忽略
+    │   ├── <sellerId>_treatment_002.csv   ← 唯一消费的文件
     │   └── ...
     └── ...
 
+只消费 <sellerId>_treatment_002.csv（变体名见 INPUT_VARIANT），sellerId = WB 数字卖家 ID。
 CSV 只有一列 nm_id，每行一个 nmID。
 
 本模块只负责"读"，不做任何写 OSS 操作；写 OSS 复用 wb_to_oss.convert_and_upload_shard。
@@ -21,6 +24,10 @@ from wb_to_oss import DEFAULT_CONFIG, oss_target
 
 # 输入根目录（bucket 根下，与输出 prefix 无关）
 INPUT_PREFIX = "content-opt-pool/"
+
+# 只消费该变体的输入文件：<sellerId>_treatment_002.csv（忽略 _control / _treatment_001 等）。
+# 日后要换实验组只改这一处。
+INPUT_VARIANT = "treatment_002"
 
 
 def get_bucket(config_path=DEFAULT_CONFIG):
@@ -51,9 +58,11 @@ def list_task_ids(bucket=None):
 
 
 def list_store_csvs(task_id, bucket=None):
-    """列出某 taskId 下所有 *.csv 的 OSS key。返回 [(oss_key, store_id), ...]。
+    """列出某 taskId 下所有待消费的输入 CSV。返回 [(oss_key, seller_id), ...]。
 
-    store_id = 文件名去掉 .csv 后缀（WB 数字卖家 ID）。
+    只认 <sellerId>_<INPUT_VARIANT>.csv（默认 <sellerId>_treatment_002.csv）；
+    _control / _treatment_001 / 纯 <sellerId>.csv 等一律忽略。
+    seller_id = 变体后缀之前的 WB 数字卖家 ID（250149024_treatment_002.csv → 250149024）。
     """
     if bucket is None:
         bucket, err = get_bucket()
@@ -62,14 +71,16 @@ def list_store_csvs(task_id, bucket=None):
             return []
     import oss2
     prefix = f"{INPUT_PREFIX}{task_id}/"
+    suffix = f"_{INPUT_VARIANT}.csv"
     results = []
     for obj in oss2.ObjectIterator(bucket, prefix=prefix):
         if obj.is_prefix():
             continue
         name = os.path.basename(obj.key)
-        if name.endswith(".csv"):
-            store_id = name[: -len(".csv")]
-            results.append((obj.key, store_id))
+        if name.endswith(suffix):
+            seller_id = name[: -len(suffix)]
+            if seller_id:
+                results.append((obj.key, seller_id))
     return sorted(results)
 
 

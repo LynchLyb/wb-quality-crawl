@@ -10,7 +10,7 @@
     python -m nmid_fetch.bench_api --store store1 --nmid-file ids.txt --interval 2.0
 
 nmID 来源（三选一，优先级从高到低）:
-    --nmids 逗号分隔 / --nmid-file 文本文件（每行一个）/ 自动取本店最新 input_*.csv
+    --nmids 逗号分隔 / --nmid-file 文本文件（每行一个）/ 自动取本店最新 *_treatment_002.csv
 
 安全设计:
     - 复用 fetch_by_nmid.lock：生产 worker 在跑时拒绝启动，避免互相干扰计时与触发限流
@@ -52,8 +52,8 @@ def collect_nmids(args, store_id):
     if args.nmid_file:
         with open(args.nmid_file, encoding="utf-8-sig") as f:
             return [line.strip() for line in f if line.strip()]
-    # 自动：本店 nmid_data/<store>/*/input_*.csv 中最新的一个
-    pattern = os.path.join(DATA_ROOT, store_id, "*", "input_*.csv")
+    # 自动：本店 nmid_data/<store>/*/<sellerId>_treatment_002.csv 中最新的一个
+    pattern = os.path.join(DATA_ROOT, store_id, "*", f"*_{oss_input.INPUT_VARIANT}.csv")
     candidates = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
     if not candidates:
         return []
@@ -134,7 +134,7 @@ def main():
 
     nmids = collect_nmids(args, store_id)
     if not nmids:
-        print("[BENCH] 无可用 nmID：请用 --nmids / --nmid-file，或确认本店有 input_*.csv")
+        print("[BENCH] 无可用 nmID：请用 --nmids / --nmid-file，或确认本店有 *_treatment_002.csv")
         return 2
     total = args.warmup + args.count
     if len(nmids) < total:

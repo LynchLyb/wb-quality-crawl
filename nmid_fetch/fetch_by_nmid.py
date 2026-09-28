@@ -2,7 +2,7 @@
 """按 nmID 集合抓取 WB 商品数据（核心逻辑）。
 
 流程:
-    1. 从 OSS content-opt-pool/<taskId>/<sellerId>.csv 下载 nmID 列表
+    1. 从 OSS content-opt-pool/<taskId>/<sellerId>_treatment_002.csv 下载 nmID 列表
     2. 启动 Chrome（复用该店 profile）→ 选店 → 捕获首条 tableListv6 请求
     3. 对每个 nmID，把捕获请求体的 filter.search 替换为该 nmID 后重放
     4. 命中(有 cards)加入 buffer，未命中直接丢弃
@@ -180,6 +180,7 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
     shard_index = 1
     query_count = 0
     matched_count = 0
+    buffer = []          # 命中缓存；提前初始化，确保选店/捕获失败提前 return 时 finally 能安全引用（否则 UnboundLocalError 且漏掉 driver.quit）
     st = load_state(run_dir) if resume else None
     if st and not st.get("finished"):
         run_ts = st.get("run_ts", run_ts)
@@ -255,7 +256,6 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
             except json.JSONDecodeError:
                 body_template = None
 
-        buffer = []
         consecutive_fail = 0
         server_fail = 0
         base_interval = CALL_INTERVAL   # 闭环退避动态间隔，起始 = floor
@@ -406,7 +406,8 @@ def process_task(store, task_id, seller_id, resume=True, stop_event=None, progre
     if target_key is None:
         print(f"[ERROR] taskId={task_id} 下找不到 sellerId={seller_id} 的 CSV")
         return {"finished": False, "error": "csv_not_found"}
-    local_csv = os.path.join(_run_dir(store_id, task_id), f"input_{seller_id}.csv")
+    # 下载后保留 OSS 原文件名（如 250149024_treatment_002.csv），便于在 nmid_data 下直接辨认最新输入
+    local_csv = os.path.join(_run_dir(store_id, task_id), os.path.basename(target_key))
     ok, err = oss_input.download_csv(target_key, local_csv)
     if not ok:
         print(f"[ERROR] 下载 CSV 失败: {err}")
