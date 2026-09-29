@@ -35,7 +35,11 @@ STORES = [
     {"id": "store1", "profile_dir": "chrome_profile",  "data_dir": ".",           "oss_segment": "store1"},
     # store2 已登录并续拉中：auto_start=True，随宿主 AUTO_START 一起自动 --resume 续传（与 store1 一致）
     {"id": "store2", "profile_dir": "profiles/store2", "data_dir": "data/store2", "oss_segment": "store2", "auto_start": True},
-    # store3 已按需求暂时移除（暂不抓取该店数据）；日后需要时照 store2 再加一行即可
+    # store3 第三个店：新店 auto_start=False（profile 未登录前防旧宿主空转重启）；nmid_fetch 不看 auto_start，
+    #   只要生产机 config.json 配了它的卖家 ID 且 profiles/store3 已登录，新模块就会跑它
+    {"id": "store3", "profile_dir": "profiles/store3", "data_dir": "data/store3", "oss_segment": "store3", "auto_start": False},
+    # store4 第四个店：同 store3，新卖家新代号（不复用旧代号，避免旧数据/profile 串味）
+    {"id": "store4", "profile_dir": "profiles/store4", "data_dir": "data/store4", "oss_segment": "store4", "auto_start": False},
 ]
 DEFAULT_STORE = "store1"
 
@@ -72,7 +76,7 @@ def all_stores():
 
 
 # ---------------------------------------------------------------- 店铺校验用卖家 ID
-# config.json: {"store1": 25013****, "store2": 25014****}（示例已脱敏，真实值仅存生产机本地 config.json）
+# config.json: {"store1": <卖家ID>, "store2": <卖家ID>, "store3": <卖家ID>, "store4": <卖家ID>}（每店代号→真实 WB 卖家 ID，店数不限；示例占位，真实值仅存生产机本地 config.json，不入库）
 # 抓取前用它校验页面下拉框选中的店铺，防止登录错账号、爬错店数据。
 SELLER_ID_FILE = os.path.join(BASE_DIR, "config.json")
 

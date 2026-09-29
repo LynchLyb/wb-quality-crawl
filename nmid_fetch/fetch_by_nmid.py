@@ -94,7 +94,7 @@ def _run_dir(store_id, task_id, variant=None, index=None):
 
 
 def store_id_for_seller(seller_id):
-    """CSV 文件名（WB 数字卖家 ID）→ config 店铺 id（store1/store2）；找不到返回 None。"""
+    """CSV 文件名（WB 数字卖家 ID）→ config 店铺 id（STORES 里任一店）；找不到返回 None。"""
     for s in config.STORES:
         if config.get_seller_id(s["id"]) == str(seller_id):
             return s["id"]
@@ -597,7 +597,7 @@ def process_task(store, task_id, seller_id, resume=True, stop_event=None, progre
 
 def main():
     ap = argparse.ArgumentParser(description="按 nmID 集合抓取 WB 商品数据")
-    ap.add_argument("--store", default=None, help="店铺 id（store1/store2）；缺省遍历全部")
+    ap.add_argument("--store", default=None, help="店铺 id（config.STORES 里任一店，如 store1/store2/store3/store4）；缺省遍历全部")
     ap.add_argument("--task-id", default=None, help="只处理指定 taskId；缺省遍历全部")
     ap.add_argument("--resume", action="store_true", help="从断点续传")
     args = ap.parse_args()

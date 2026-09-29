@@ -83,7 +83,7 @@ def _sleep_idle(seconds, reason, extra=None):
 
 
 def _plan_jobs():
-    """拉一轮待跑清单：(jobs, 本轮跳过原因汇总)。只保留 config.json 里的两个店。"""
+    """拉一轮待跑清单：(jobs, 本轮跳过原因汇总)。只保留 config.json 里已配置卖家 ID 的店铺（店数不限）。"""
     sellers = _configured_sellers()
     jobs, unknown = oss_input.plan_round(sellers=sellers)
     skipped = []

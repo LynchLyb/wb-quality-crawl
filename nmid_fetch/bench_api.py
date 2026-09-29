@@ -115,7 +115,7 @@ def timed_call(driver, url, method, headers, post_data, label):
 # ---------------------------------------------------------------- 主流程
 def main():
     ap = argparse.ArgumentParser(description="tableListv6 vs GetCardInfo 耗时基准")
-    ap.add_argument("--store", required=True, help="店铺 id（config.STORES 里的 store1/store2）")
+    ap.add_argument("--store", required=True, help="店铺 id（config.STORES 里任一店，如 store1/store2/store3/store4）")
     ap.add_argument("--nmids", help="逗号分隔的 nmID 列表")
     ap.add_argument("--nmid-file", help="nmID 文本文件（每行一个）")
     ap.add_argument("--count", type=int, default=20, help="参与测试的 nmID 数（默认 20）")
