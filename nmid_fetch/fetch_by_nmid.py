@@ -24,6 +24,7 @@ import time
 import config
 from script import PAGE_URL, create_driver
 from wb_to_oss import convert_and_upload_shard, oss_target
+from nmid_fetch import oss_input   # 复用 INPUT_VARIANT：产出分片名带变体标记，与 A 机 001/control 区分
 
 # 复用旧模块的通用能力（选店/捕获/调接口/清理/锁），不复制代码
 from fetch_all import (
@@ -118,8 +119,12 @@ def reset_state_for_new_round(run_dir):
 
 # ---------------------------------------------------------------- 分片与上传
 def flush_shard(buffer, shard_index, run_ts, task_id, seller_id, out_dir):
-    """写分片文件，文件名 {taskId}_{sellerId}_shard_NNN_{run_ts}.json。"""
-    name = f"{task_id}_{seller_id}_shard_{shard_index:03d}_{run_ts}.json"
+    """写分片文件，文件名 {taskId}_{sellerId}_treatment_002_shard_NNN_{run_ts}.json。
+
+    变体标记取自 oss_input.INPUT_VARIANT（=treatment_002），插在 _shard 前：与 A 机产出
+    （_treatment_001 / _control）一眼可辨；转换后的 CSV 沿用分片 stem，自动带上同一标记。
+    """
+    name = f"{task_id}_{seller_id}_{oss_input.INPUT_VARIANT}_shard_{shard_index:03d}_{run_ts}.json"
     path = os.path.join(out_dir, name)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(buffer, f, ensure_ascii=False)
