@@ -37,9 +37,11 @@ def get_bucket(config_path=DEFAULT_CONFIG):
 
 
 def list_task_ids(bucket=None):
-    """列出 content-opt-pool/ 下所有 taskId 目录名（不含尾斜杠）。
+    """列出 content-opt-pool/ 下所有 taskId 目录名（不含尾斜杠），按日期倒序（最新优先）。
 
     用 delimiter='/' 只列一级子目录，避免递归扫全量对象。
+    taskId 形如 aer-20260925-bc0715：日期 YYYYMMDD 零填充且偏移固定，字典序即时间序，
+    故 reverse=True 即"最新日期先跑"。
     """
     if bucket is None:
         bucket, err = get_bucket()
@@ -50,11 +52,11 @@ def list_task_ids(bucket=None):
     task_ids = []
     for obj in oss2.ObjectIterator(bucket, prefix=INPUT_PREFIX, delimiter="/"):
         if obj.is_prefix():
-            # obj.key 形如 content-opt-pool/task_001/，取中间段
+            # obj.key 形如 content-opt-pool/aer-20260925-bc0715/，取中间段
             rel = obj.key[len(INPUT_PREFIX):].strip("/")
             if rel:
                 task_ids.append(rel)
-    return sorted(task_ids)
+    return sorted(task_ids, reverse=True)
 
 
 def list_store_csvs(task_id, bucket=None):
