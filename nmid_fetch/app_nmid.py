@@ -46,6 +46,13 @@ HOST = "127.0.0.1"
 PORT = 8081
 IDLE_SLEEP = 60  # 无数据时的等待间隔（秒）
 
+# 失败退避：避免致命错误（浏览器起不来/驱动不匹配/登录态失效等）被零延迟无限重试刷爆
+# （历史事故：Chrome 升到 155、锁定驱动还是 153，启动必崩，零退避狂刷 3.6 万次 ≈ 停了几天）
+FAST_RETRY_LIMIT = 3      # 前 N 次连续失败用短退避快速重试；超过则转低频长退避
+FAST_BACKOFF_BASE = 30    # 短退避基数（秒）：30 → 60 → 120 ...
+FAST_BACKOFF_CAP = 300    # 短退避封顶（秒）
+LONG_BACKOFF = 1800       # 连续失败超过 FAST_RETRY_LIMIT 后，每 30 分钟低频重试（仍在跑，可自愈/可人工介入）
+
 app = Flask(__name__)
 
 # 全局运行状态
@@ -57,6 +64,7 @@ _worker_lock = threading.Lock()
 
 def _main_loop():
     """常驻循环：遍历所有 taskId 的所有店铺 CSV，一轮跑完立即重新开始。"""
+    consecutive_fail = 0   # 连续“整轮无进展且报错”的次数，用于失败退避（防致命错误零延迟狂刷）
     while not _stop_event.is_set():
         task_ids = oss_input.list_task_ids()
         if not task_ids:
@@ -70,6 +78,9 @@ def _main_loop():
             continue
 
         round_done = True
+        round_had_error = False     # 本轮是否有任务报错（异常或返回 error）
+        round_had_success = False   # 本轮是否有任务真正跑完（finished）——有进展就不算连续失败
+        last_err = None
         for tid in task_ids:
             if _stop_event.is_set():
                 return
@@ -92,15 +103,48 @@ def _main_loop():
                 try:
                     r = process_task(store, tid, seller_id, resume=True,
                                      stop_event=_stop_event, progress=_progress)
-                    if not r.get("finished"):
+                    if r.get("finished"):
+                        round_had_success = True
+                    elif r.get("error"):
+                        round_had_error = True
+                        last_err = str(r.get("error"))
+                        round_done = False
+                    else:
                         round_done = False
                 except Exception as e:
-                    print(f"[ERROR] 处理 {tid}/{seller_id} 异常: {type(e).__name__}: {e}")
+                    round_had_error = True
+                    last_err = f"{type(e).__name__}: {e}"
+                    print(f"[ERROR] 处理 {tid}/{seller_id} 异常: {last_err}")
                     round_done = False
                 finally:
                     release_single_instance(lock)
 
-        if round_done and not _stop_event.is_set():
+        if _stop_event.is_set():
+            return
+
+        # 整轮报错且无任何进展：进入退避，避免致命错误被零延迟无限重试刷爆
+        if round_had_error and not round_had_success:
+            consecutive_fail += 1
+            if consecutive_fail <= FAST_RETRY_LIMIT:
+                delay = min(FAST_BACKOFF_BASE * (2 ** (consecutive_fail - 1)), FAST_BACKOFF_CAP)
+            else:
+                delay = LONG_BACKOFF
+            snap = dict(_progress.get("snap") or {})
+            snap.update({"status": "backoff", "consecutive_fail": consecutive_fail,
+                         "last_error": last_err, "retry_in_sec": delay,
+                         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+            _progress["snap"] = snap
+            print(f"[BACKOFF] 连续失败 {consecutive_fail} 次，最近错误: {last_err}；{delay}s 后重试"
+                  f"（超过 {FAST_RETRY_LIMIT} 次转 {LONG_BACKOFF}s 低频重试，直到自愈或人工介入）")
+            slept = 0
+            while slept < delay and not _stop_event.is_set():
+                time.sleep(1)
+                slept += 1
+            continue
+
+        # 有进展：清零失败计数
+        consecutive_fail = 0
+        if round_done:
             # 一轮跑完：重置断点，立即开始下一轮（每次全量处理）
             print("[ROUND] 本轮全部完成，重置断点后立即开始下一轮")
             for tid in task_ids:
@@ -108,7 +152,7 @@ def _main_loop():
                     sid = store_id_for_seller(seller_id)
                     if sid and config.is_store_enabled(sid):
                         reset_state_for_new_round(_run_dir(sid, tid))
-        # round_done=False 时（有任务未完成/被跳过）也立即重试下一轮
+        # round_done=False 但有进展（部分任务被跳过/未完成）时立即重试下一轮
 
 
 def _ensure_worker():

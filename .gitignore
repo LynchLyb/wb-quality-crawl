@@ -46,6 +46,8 @@ __pycache__/
 # ---- 浏览器驱动等大二进制（按需另行下载）----
 chromedriver.exe
 chromedriver
+# 退役的旧版驱动（改名保留可回滚；大二进制勿提交）
+chromedriver.exe.retired-*
 
 # ---- IDE / 编辑器 / 工具缓存 ----
 .idea/
