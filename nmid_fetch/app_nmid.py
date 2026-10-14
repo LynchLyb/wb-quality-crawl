@@ -49,6 +49,12 @@ HOST = "127.0.0.1"
 PORT = 8081
 IDLE_SLEEP = 60  # 本轮没干活（无数据 / 全部被跳过）时的等待间隔（秒）
 
+# 连续致命失败（整轮没能跑完：浏览器起不来/崩溃/异常/终态错误/锁被占）达上限后，
+# 不再紧凑重试，改为长退避低频重试——不停、不放弃，直到某轮自愈（跑完）或人工介入。
+# 比紧凑重试温和得多（如崩溃循环：3 次/分 → 3 次/30 分），但仍会持续尝试。
+FATAL_ROUND_LIMIT = 3        # 连续多少轮致命失败后切入长退避
+FATAL_BACKOFF_SLEEP = 1800   # 长退避间隔（秒）= 30 分钟
+
 app = Flask(__name__)
 
 # 全局运行状态
@@ -109,6 +115,7 @@ def _plan_jobs():
 def _main_loop():
     """常驻循环：按规则跑 treatment_001（每轮重复）+ control（每上传一份只跑一次、
     台账去重、单独存放且跑过不再下载）。"""
+    fatal_rounds = 0   # 连续“整轮没能跑完”的致命失败计数（跑完一轮即清零）
     while not _stop_event.is_set():
         jobs, skipped = _plan_jobs()
         if not jobs:
@@ -188,21 +195,38 @@ def _main_loop():
             finally:
                 release_single_instance(lock)
 
-        if not worked and not _stop_event.is_set():
-            # 整轮都被跳过（如锁被占）：等一会儿再试，不空转刷 OSS / 刷日志
-            print(f"[IDLE] 本轮未实际执行任何任务，{IDLE_SLEEP}s 后重试")
-            if not _sleep_idle(IDLE_SLEEP, "nothing_executed", {"skipped": skipped}):
-                return
+        if round_done:
+            # 本轮全部跑完：健康信号，清零致命计数
+            fatal_rounds = 0
+            if not _stop_event.is_set():
+                # treatment 一轮跑完：重置断点，立即开始下一轮（每次全量重跑）
+                # control 不重置：它只跑一次，靠台账去重，出现更新的文件时自然重跑
+                print(f"[ROUND] 本轮全部完成，重置 {len(treatments)} 个 treatment 断点后立即开始下一轮")
+                for store_id, j in treatments:
+                    reset_state_for_new_round(
+                        _run_dir(store_id, j["task_id"], j["variant"], j["index"]),
+                        oss_input.variant_tag(j["variant"], j["index"]))
             continue
 
-        if round_done and not _stop_event.is_set():
-            # treatment 一轮跑完：重置断点，立即开始下一轮（每次全量重跑）
-            # control 不重置：它只跑一次，靠台账去重，出现更新的文件时自然重跑
-            print(f"[ROUND] 本轮全部完成，重置 {len(treatments)} 个 treatment 断点后立即开始下一轮")
-            for store_id, j in treatments:
-                reset_state_for_new_round(
-                    _run_dir(store_id, j["task_id"], j["variant"], j["index"]),
-                    oss_input.variant_tag(j["variant"], j["index"]))
+        # 走到这里 = 本轮没能跑完（worked 与否都算）：浏览器起不来/崩溃/异常/终态错误/锁被占等。
+        # 达上限后不停，改长退避低频重试，直到某轮自愈（跑完）或人工 /stop 介入。
+        if _stop_event.is_set():
+            return
+        fatal_rounds += 1
+        if fatal_rounds >= FATAL_ROUND_LIMIT:
+            print(f"[FATAL] 连续 {fatal_rounds} 轮未能跑完（worked={worked}），进入长退避："
+                  f"每 {FATAL_BACKOFF_SLEEP // 60} 分钟低频重试一次，直到自愈或人工介入")
+            if not _sleep_idle(FATAL_BACKOFF_SLEEP, "fatal_backoff",
+                               {"fatal_rounds": fatal_rounds, "skipped": skipped}):
+                return
+            continue
+        # 未达上限：短退避后重试（含原 nothing_executed 语义，统一到这里）
+        print(f"[RETRY] 本轮未跑完（worked={worked}），连续致命 {fatal_rounds}/{FATAL_ROUND_LIMIT}，"
+              f"{IDLE_SLEEP}s 后重试")
+        if not _sleep_idle(IDLE_SLEEP, "retry_after_fatal",
+                           {"fatal_rounds": fatal_rounds, "skipped": skipped}):
+            return
+        continue
 
 
 def _ensure_worker():

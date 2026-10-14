@@ -14,10 +14,12 @@
 import base64
 import json
 import os
+import subprocess
 import sys
 import time
 
 from selenium import webdriver
+from selenium.common.exceptions import SessionNotCreatedException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
@@ -37,6 +39,44 @@ SCROLL_INTERVAL = 0.5   # 两次滚动之间的间隔（秒）
 # 注：Chrome 136+ 禁止对默认资料目录开启远程调试，故不能直接指向日常 User Data
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_profile")
 
+# Chrome 常见安装位置：profile 迁移自愈时直接调用 chrome（不经 chromedriver）
+_CHROME_EXE_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
+
+
+def _find_chrome_exe():
+    """本机 chrome.exe 路径（找不到返回 None）。"""
+    for p in _CHROME_EXE_CANDIDATES:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def _migrate_profile_once(profile_dir: str, timeout: int = 90) -> bool:
+    """Chrome 大版本升级后首次打开老 profile 需一次性迁移；chromedriver 会在迁移完成前
+    超时杀进程，报 SessionNotCreated(cannot parse internal JSON template)。这里用 chrome
+    直接 headless 跑一次触发迁移落地（不占调试端口），之后 chromedriver 即可正常握手。
+    迁移是 profile 数据层面的，headless 触发后 GUI 启动同样受益。"""
+    exe = _find_chrome_exe()
+    if not exe:
+        return False
+    try:
+        subprocess.run(
+            [exe, "--headless=new", "--disable-gpu", "--no-first-run",
+             "--no-default-browser-check", f"--user-data-dir={profile_dir}",
+             "--dump-dom", "about:blank"],
+            timeout=timeout,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return True
+    except Exception as e:
+        print(f"[MIGRATE] chrome 直接迁移 profile 失败: {type(e).__name__}: {e}")
+        return False
+
 
 def create_driver(headless: bool, profile_dir: str = PROFILE_DIR) -> webdriver.Chrome:
     options = Options()
@@ -54,9 +94,20 @@ def create_driver(headless: bool, profile_dir: str = PROFILE_DIR) -> webdriver.C
         "enablePage": False,
     })
 
-    if os.path.exists(CHROMEDRIVER_PATH):
-        return webdriver.Chrome(service=Service(CHROMEDRIVER_PATH), options=options)
-    return webdriver.Chrome(options=options)
+    def _build() -> webdriver.Chrome:
+        if os.path.exists(CHROMEDRIVER_PATH):
+            return webdriver.Chrome(service=Service(CHROMEDRIVER_PATH), options=options)
+        return webdriver.Chrome(options=options)
+
+    try:
+        return _build()
+    except SessionNotCreatedException as e:
+        # 多为 Chrome 升级后老 profile 未迁移：直接用 chrome 跑一次触发迁移，再重试一次
+        print(f"[MIGRATE] chromedriver 起浏览器失败（{type(e).__name__}），"
+              f"尝试迁移 profile 后重试: {profile_dir}")
+        if _migrate_profile_once(profile_dir):
+            return _build()
+        raise
 
 
 def drain_performance_logs(driver):
