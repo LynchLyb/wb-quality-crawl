@@ -19,9 +19,10 @@ from flask import Flask, jsonify, request
 from waitress import serve
 
 import config
+from wb_to_oss import oss_today
 from nmid_fetch import oss_input
 from nmid_fetch.fetch_by_nmid import (
-    _lock_file, _run_dir, process_task, reset_state_for_new_round,
+    _lock_file, process_task, is_round_done_today,
     store_id_for_seller,
 )
 from fetch_all import acquire_single_instance, release_single_instance
@@ -62,31 +63,57 @@ _worker_thread = None
 _worker_lock = threading.Lock()
 
 
+def _idle_sleep(seconds=IDLE_SLEEP):
+    """可中断空闲等待：期间收到 stop 立即返回。"""
+    for _ in range(seconds):
+        if _stop_event.is_set():
+            return
+        time.sleep(1)
+
+
+def _compute_today_done(task_ids):
+    """实时从磁盘判定：本机启用的所有 (store, taskId) 今日一轮是否都已完整跑完。
+
+    无 task → False（协调器按 pending=0 走巡检兜底）；有任务且全部完成 → True。
+    新出现的 taskId 无完成标记 → 立即 False，当天补跑。
+    """
+    if not task_ids:
+        return False
+    today = oss_today()
+    found_any = False
+    for tid in task_ids:
+        for _key, seller_id in oss_input.list_store_csvs(tid):
+            sid = store_id_for_seller(seller_id)
+            if sid is None or not config.is_store_enabled(sid):
+                continue
+            found_any = True
+            if not is_round_done_today(sid, tid, today):
+                return False
+    return found_any
+
+
 def _main_loop():
-    """常驻循环：遍历所有 taskId 的所有店铺 CSV，一轮跑完立即重新开始。"""
+    """常驻循环：每个 BJT 日把本机启用店铺的 nmID 各完整跑一轮。
+
+    当天跑完即停（不再重复抓取），剩余时间由协调器切给旧模块日常巡检；
+    次日 BJT 午夜后 round_date 不再等于今天 → 自动开新一轮。失败/中断 = 断点续传，不算完成。
+    """
     consecutive_fail = 0   # 连续“整轮无进展且报错”的次数，用于失败退避（防致命错误零延迟狂刷）
     while not _stop_event.is_set():
         task_ids = oss_input.list_task_ids()
         if not task_ids:
             _progress["snap"] = {"status": "idle", "reason": "no_pending_tasks",
+                                 "today_done": False,
                                  "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
             # 无数据：等待，不空转
-            for _ in range(IDLE_SLEEP):
-                if _stop_event.is_set():
-                    return
-                time.sleep(1)
+            _idle_sleep()
             continue
 
-        round_done = True
-        round_had_error = False     # 本轮是否有任务报错（异常或返回 error）
-        round_had_success = False   # 本轮是否有任务真正跑完（finished）——有进展就不算连续失败
-        last_err = None
+        today = oss_today()
+        # 收集本机启用、映射到店铺、且今日未完成的 (store_id, tid, seller_id)
+        pending_pairs = []
         for tid in task_ids:
-            if _stop_event.is_set():
-                return
             for _key, seller_id in oss_input.list_store_csvs(tid):
-                if _stop_event.is_set():
-                    return
                 store_id = store_id_for_seller(seller_id)
                 if store_id is None:
                     print(f"[WARN] sellerId={seller_id} 未在 config.json 配置，跳过")
@@ -94,33 +121,46 @@ def _main_loop():
                 if not config.is_store_enabled(store_id):
                     print(f"[WARN] sellerId={seller_id} -> {store_id} 在本机被 config.local.json 禁用，跳过")
                     continue
-                store = config.get_store(store_id)
-                lock = _lock_file(store_id)
-                if not acquire_single_instance(lock):
-                    print(f"[LOCK] {store_id} 已被其他进程占用，跳过本轮")
-                    round_done = False
-                    continue
-                try:
-                    r = process_task(store, tid, seller_id, resume=True,
-                                     stop_event=_stop_event, progress=_progress)
-                    if r.get("finished"):
-                        round_had_success = True
-                    elif r.get("error"):
-                        round_had_error = True
-                        last_err = str(r.get("error"))
-                        round_done = False
-                    else:
-                        round_done = False
-                except Exception as e:
-                    round_had_error = True
-                    last_err = f"{type(e).__name__}: {e}"
-                    print(f"[ERROR] 处理 {tid}/{seller_id} 异常: {last_err}")
-                    round_done = False
-                finally:
-                    release_single_instance(lock)
+                if is_round_done_today(store_id, tid, today):
+                    continue   # 今日该 (店,任务) 已完整跑完，当天不再重复抓取
+                pending_pairs.append((store_id, tid, seller_id))
 
-        if _stop_event.is_set():
-            return
+        if not pending_pairs:
+            # 今日全部完成：停止当天重复抓取，剩余时间交给旧模块巡检（由协调器切换）
+            _progress["snap"] = {"status": "done_today", "today": today, "today_done": True,
+                                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            print(f"[DAILY] 今日({today}) nmID 轮次已全部完成，停止当天重复抓取，等待次日新一轮/交给巡检")
+            consecutive_fail = 0
+            _idle_sleep()
+            continue
+
+        round_had_error = False     # 本轮是否有任务报错（异常或返回 error）
+        round_had_success = False   # 本轮是否有任务真正跑完（finished）——有进展就不算连续失败
+        last_err = None
+        for store_id, tid, seller_id in pending_pairs:
+            if _stop_event.is_set():
+                return
+            store = config.get_store(store_id)
+            lock = _lock_file(store_id)
+            if not acquire_single_instance(lock):
+                print(f"[LOCK] {store_id} 已被其他进程占用，跳过本轮")
+                continue
+            try:
+                r = process_task(store, tid, seller_id, resume=True,
+                                 stop_event=_stop_event, progress=_progress)
+                if r.get("finished"):
+                    round_had_success = True
+                elif r.get("error"):
+                    round_had_error = True
+                    last_err = str(r.get("error"))
+            except Exception as e:
+                round_had_error = True
+                last_err = f"{type(e).__name__}: {e}"
+                print(f"[ERROR] 处理 {tid}/{seller_id} 异常: {last_err}")
+            finally:
+                release_single_instance(lock)
+            if _stop_event.is_set():
+                return
 
         # 整轮报错且无任何进展：进入退避，避免致命错误被零延迟无限重试刷爆
         if round_had_error and not round_had_success:
@@ -131,7 +171,7 @@ def _main_loop():
                 delay = LONG_BACKOFF
             snap = dict(_progress.get("snap") or {})
             snap.update({"status": "backoff", "consecutive_fail": consecutive_fail,
-                         "last_error": last_err, "retry_in_sec": delay,
+                         "last_error": last_err, "retry_in_sec": delay, "today_done": False,
                          "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
             _progress["snap"] = snap
             print(f"[BACKOFF] 连续失败 {consecutive_fail} 次，最近错误: {last_err}；{delay}s 后重试"
@@ -142,17 +182,8 @@ def _main_loop():
                 slept += 1
             continue
 
-        # 有进展：清零失败计数
+        # 有进展：清零失败计数，立即进入下一轮循环（重算 pending_pairs，当天已完成的不再跑）
         consecutive_fail = 0
-        if round_done:
-            # 一轮跑完：重置断点，立即开始下一轮（每次全量处理）
-            print("[ROUND] 本轮全部完成，重置断点后立即开始下一轮")
-            for tid in task_ids:
-                for _key, seller_id in oss_input.list_store_csvs(tid):
-                    sid = store_id_for_seller(seller_id)
-                    if sid and config.is_store_enabled(sid):
-                        reset_state_for_new_round(_run_dir(sid, tid))
-        # round_done=False 但有进展（部分任务被跳过/未完成）时立即重试下一轮
 
 
 def _ensure_worker():
@@ -177,11 +208,15 @@ def health():
 def status():
     snap = dict(_progress.get("snap") or {})
     snap["worker_alive"] = _worker_thread is not None and _worker_thread.is_alive()
-    # 待处理任务数（供协调器判断是否需要切换）
+    # 待处理任务数 + 今日是否已全部跑完（供协调器判断切换）。
+    # today_done 从磁盘现算，不读 worker 内存快照——确保新 worker 停着时跨天也能翻回 False。
     try:
-        snap["pending_task_count"] = len(oss_input.list_task_ids())
+        task_ids = oss_input.list_task_ids()
+        snap["pending_task_count"] = len(task_ids)
+        snap["today_done"] = _compute_today_done(task_ids)
     except Exception:
         snap["pending_task_count"] = 0
+        snap["today_done"] = False
     return jsonify(snap)
 
 

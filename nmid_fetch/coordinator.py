@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
-"""新旧模块时间片轮转协调器（方案 A）。
+"""新旧模块完成驱动日级轮次协调器。
 
 背景: Chrome profile 独占，新旧模块共用同一 profile 必须串行运行。
-本协调器通过调用两模块已有的 HTTP 接口（/stop /resume）实现时间片轮转，
+本协调器通过调用两模块已有的 HTTP 接口（/stop /resume）实现先停后启的串行调度，
 不改动任何旧代码。
 
-调度规则:
-    - 新模块无待处理数据 → 旧模块 100% 跑
-    - 新模块有数据 → 天级轮转：新模块每天跑 NEW_START_HOUR 起的 NEW_HOURS 小时（默认 00:00-12:00）
-    - 新模块窗口外 → 旧模块跑（断点续传）
-    - 新模块窗口内未跑完 → 第二天窗口从断点继续
+调度规则（完成驱动日级轮次，BJT 日界）:
+    - 新模块今日 nmID 轮次未完成（有数据且 today_done=False）→ 新模块跑，压制旧模块
+    - 新模块今日已完成 或 无待处理数据 → 旧模块日常巡检跑当天剩余时间（断点续传）
+    - 新模块当天跑完即停，次日 BJT 午夜后 today_done 翻 False → 自动切回新模块开新一轮
+    - 先停后启（stop→wait→resume），绝不并发占用同一 Chrome profile
 
 守护:
     - 切换失败重试 3 次；停止超时则放弃本次切换（避免 profile 冲突）
     - 停止等待超时 180s（覆盖旧模块首捕 120s + 限流暂停 30s 的最坏优雅停止耗时）
-    - 新模块窗口内每分钟补发旧模块 /stop，防旧宿主 AUTO_START/崩溃重启复活 worker
+    - 新模块该跑时每分钟补发旧模块 /stop，防旧宿主 AUTO_START/崩溃重启复活 worker
     - 主循环 try/except 包裹，单次异常不致进程猝死
     - 心跳文件供 check_health.py 判断存活
 
@@ -26,7 +26,6 @@ import os
 import sys
 import time
 import urllib.request
-from datetime import datetime
 
 OLD_MODULE = "http://127.0.0.1:8080"   # 旧模块 app.py
 NEW_MODULE = "http://127.0.0.1:8081"   # 新模块 app_nmid.py
@@ -104,9 +103,6 @@ def _http_post(url, timeout=10):
     except Exception:
         return False
 
-NEW_START_HOUR = 0         # 新模块每天窗口开始小时（可调）
-NEW_HOURS = 24             # 新模块每天运行小时数（可调；24=全量跑新，旧模块仅在无待处理 nmID 任务时兜底）
-                           # 约束: NEW_START_HOUR + NEW_HOURS <= 24（窗口不跨天）
 STOP_WAIT_TIMEOUT = 180    # 等待模块完全停止的最长时间（秒）；旧模块优雅停止最坏
                            # ≈ 首捕 CAPTURE_TIMEOUT 120s + 限流 RATE_LIMIT_PAUSE 30s + 周期余量
 SWITCH_RETRY = 3           # 切换失败重试次数
@@ -135,12 +131,18 @@ def wait_worker_stopped(base_url, timeout=STOP_WAIT_TIMEOUT):
     return not _worker_alive(base_url)
 
 
-def _pending_new_tasks():
-    """新模块是否有待处理数据（pending_task_count > 0）。"""
+def _new_work_pending_today():
+    """新模块今日是否仍有未完成的 nmID 轮次（有数据且 today_done=False）。
+
+    today_done 由新模块 /status 从磁盘现算：新 worker 停着时跨天也会翻回 False，
+    因此无需协调器自己看时钟，日界完全由新模块的 BJT round_date 驱动。
+    """
     data = _http_get_json(f"{NEW_MODULE}/status")
-    if isinstance(data, dict):
-        return (data.get("pending_task_count") or 0) > 0
-    return False
+    if not isinstance(data, dict):
+        return False
+    if (data.get("pending_task_count") or 0) <= 0:
+        return False
+    return not data.get("today_done")
 
 
 def switch_to_new():
@@ -158,7 +160,7 @@ def switch_to_new():
         _log("[协调器] 新模块 /resume 调用失败")
         _record_switch("OLD->NEW", False, "new /resume failed")
         return False
-    _record_switch("OLD->NEW", True, "new window 00:00-12:00")
+    _record_switch("OLD->NEW", True, "new round (today not done)")
     return True
 
 
@@ -177,7 +179,7 @@ def switch_to_old():
         _log("[协调器] 旧模块 /resume 调用失败")
         _record_switch("NEW->OLD", False, "old /resume failed")
         return False
-    _record_switch("NEW->OLD", True, "old window 12:00-24:00")
+    _record_switch("NEW->OLD", True, "old inspection (today done / no data)")
     return True
 
 
@@ -192,40 +194,50 @@ def _switch_with_retry(fn, label):
     return False
 
 
-def _in_new_window(now):
-    """当前是否处于新模块每天运行窗口（窗口不跨天）。"""
-    return NEW_START_HOUR <= now.hour < NEW_START_HOUR + NEW_HOURS
+def _old_runnable():
+    """旧模块是否还有可续跑的巡检（避免对已拉完/无可续传态的巡检每 60s 空转 /resume）。
+
+    旧模块 /status 形态为 {store_id: snap}；snap.progress 里含 finished/error。
+    任一启用店 worker 已在跑 → False；已全部 finished 或 no_resume_state → False；否则 True。
+    """
+    data = _http_get_json(f"{OLD_MODULE}/status")
+    if not isinstance(data, dict):
+        return False
+    runnable = False
+    for snap in data.values():
+        if not isinstance(snap, dict):
+            continue
+        if snap.get("worker_alive"):
+            return False          # 已在跑，无需再 resume
+        prog = snap.get("progress") or {}
+        if prog.get("finished"):
+            continue              # 该店巡检已拉完，无活可干
+        if prog.get("error") == "no_resume_state":
+            continue              # 无可续传运行，不空转
+        runnable = True
+    return runnable
 
 
 def main():
-    _log(f"[协调器] 启动：天级轮转，新模块每天 {NEW_START_HOUR:02d}:00-"
-         f"{NEW_START_HOUR + NEW_HOURS:02d}:00（{NEW_HOURS}h），"
-         f"旧模块其余 {24 - NEW_HOURS}h")
+    _log("[协调器] 启动：完成驱动日级轮次（BJT 日界）——"
+         "新模块今日 nmID 未跑完→跑新并压制旧；今日已完成/无数据→旧模块日常巡检跑剩余时间")
 
     while True:
         try:
             _write_heartbeat()
-            now = datetime.now()
 
-            if not _pending_new_tasks():
-                # 新模块无数据：旧模块 100% 跑
-                if _worker_alive(NEW_MODULE):
-                    _switch_with_retry(switch_to_old, "切旧模块")
-                time.sleep(60)
-                continue
-
-            if _in_new_window(now):
-                # 新模块窗口：新模块跑（断点续传）
+            if _new_work_pending_today():
+                # 今日 nmID 轮次未完成：新模块跑（断点续传），持续压制旧模块防抢 profile
                 if _worker_alive(OLD_MODULE):
-                    # 持续压制：防旧宿主 AUTO_START/崩溃重启复活 worker 抢 profile
                     _http_post(f"{OLD_MODULE}/stop?store=all")
                 if not _worker_alive(NEW_MODULE):
                     _switch_with_retry(switch_to_new, "切新模块")
             else:
-                # 旧模块窗口：旧模块跑
+                # 今日已完成 或 无待处理数据：旧模块日常巡检跑当天剩余时间
                 if _worker_alive(NEW_MODULE):
                     _switch_with_retry(switch_to_old, "切旧模块")
-                elif not _worker_alive(OLD_MODULE):
+                elif not _worker_alive(OLD_MODULE) and _old_runnable():
+                    # 旧模块被停/猝死且仍有可续跑巡检 → 拉活（已拉完则不空转）
                     if not _http_post(f"{OLD_MODULE}/resume?store=all"):
                         _log("[协调器] 旧模块 /resume 调用失败，下轮重试")
             time.sleep(60)

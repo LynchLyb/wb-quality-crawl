@@ -155,8 +155,8 @@ while True:  # 常驻循环
     │   │   │   └─ 更新 state.json
     │   │   ├─ 写 summary.json → 释放锁 → 关闭 Chrome
     │   └─ 该 taskId 全部店铺处理完
-    ├─ 所有 taskId 处理完
-    └─ 立即开始下一轮（不 sleep）
+    ├─ 今日所有 (店,taskId) 完成 → 落盘“今日已完成”（state.json 的 round_date+finished），停止当天重复抓取
+    └─ 空闲等待；次日 BJT 午夜后自动开新一轮（当天剩余时间由协调器切给旧模块巡检）
 ```
 
 ---
@@ -196,6 +196,7 @@ while True:  # 常驻循环
   "task_id": "task_001",
   "store_id": "25013****",
   "run_ts": "20260918_120000",
+  "round_date": "2026-09-18",
   "shard_index": 3,
   "query_count": 4500,
   "matched_count": 4200,
@@ -203,6 +204,9 @@ while True:  # 常驻循环
   "finished": false
 }
 ```
+
+- `round_date`：本轮所属 BJT 日期（轮次起始日）。`finished=true 且 round_date==今天` 即“当天已完成”，
+  重启/看门狗拉起据此跳过当天重复抓取；跨天（round_date!=今天）且已完成 → 开新一轮；未完成 → 断点续传不重置。
 
 ### 8.3 锁机制
 
@@ -250,15 +254,22 @@ while True:  # 常驻循环
 
 Chrome profile 独占：同一 profile 同一时刻只能被一个 Chrome 进程打开。新旧模块共用 profile，必须串行运行。
 
-### 9.2 调度规则
+### 9.2 调度规则（完成驱动日级轮次，BJT 日界）
+
+> 变更背景：nmID 数据量下降到单轮 <1 天（约 15-16h）即跑完，原“固定 12h/24h 时间窗”不再适用；
+> 改为“完成驱动”：新模块当天跑完一轮即停，剩余时间自动交给旧模块日常巡检，次日再开新一轮。
 
 | 规则 | 说明 |
 |---|---|
-| **新模块未准备好** | 旧模块 100% 跑 |
-| **新模块准备好后** | **天级轮转**：新模块每天 **00:00-12:00（12h）** 跑，旧模块跑 12:00-24:00（12h） |
-| **比例可调** | 改协调器 `NEW_HOURS` / `NEW_START_HOUR` 后重启协调器生效（窗口不跨天） |
-| **新模块窗口内未跑完** | 窗口外旧模块跑；新模块第二天窗口从断点继续 |
-| **OSS 清空** | 旧模块 100% 跑 |
+| **日界时区** | 北京时间 UTC+8（复用 `wb_to_oss.oss_today()`，与 OSS 归档日期同口径） |
+| **今日 nmID 未完成** | 有数据且 `today_done=False` → 新模块跑（断点续传），持续压制旧模块 |
+| **今日 nmID 已完成** | `today_done=True` → 停止当天重复抓取，旧模块日常巡检跑当天剩余时间（约 8-9h） |
+| **无待处理数据** | 旧模块日常巡检兜底跑 |
+| **次日新一轮** | BJT 午夜后 `round_date != 今天` → `today_done` 翻 False → 自动切回新模块从头跑 |
+| **日内新 taskId** | 新出现的 taskId 无完成标记 → `today_done` 立即翻 False → 当天补跑 |
+| **失败/中断** | 断点续传，`finished=False` 不计“当天完成”；在途轮次跨天续传不重置丢进度 |
+| **巡检未完成** | 旧模块保留自身断点（`fetch_all` 的 cursor），下次继续 |
+| **“当天已完成”落盘** | 以 `nmid_data/<store>/<taskId>/state.json` 的 `finished=True` + `round_date==今天` 为准，防重启/看门狗重复跑 |
 
 ### 9.3 协调器逻辑
 
@@ -266,14 +277,19 @@ Chrome profile 独占：同一 profile 同一时刻只能被一个 Chrome 进程
 # coordinator.py（实际代码要点，标准库 urllib，无新增依赖）
 OLD_MODULE = "http://127.0.0.1:8080"
 NEW_MODULE = "http://127.0.0.1:8081"
-NEW_START_HOUR = 0        # 新模块每天窗口开始小时（可调）
-NEW_HOURS = 12            # 新模块每天运行小时数（可调；旧模块跑剩余 24-NEW_HOURS 小时）
 HEARTBEAT_FILE = "nmid_data/coordinator.heartbeat"  # 每循环写一次，供 check_health 判活
 
-def _in_new_window(now):  # 天级窗口判定，边界切换
-    return NEW_START_HOUR <= now.hour < NEW_START_HOUR + NEW_HOURS
+def _new_work_pending_today():   # 完成驱动判据：有数据且今日未完成
+    data = _http_get_json(f"{NEW_MODULE}/status")
+    return (data.get("pending_task_count", 0) > 0) and (not data.get("today_done"))
+    # today_done 由新模块 /status 从磁盘 state.json 现算（非 worker 内存快照），
+    # 新 worker 停着时跨天也能翻回 False，日界无需协调器看时钟
 
-def switch_to_new():      # 任一步失败返回 False
+def _old_runnable():            # 旧模块是否还有可续跑巡检（防对已拉完的巡检空转 /resume）
+    data = _http_get_json(f"{OLD_MODULE}/status")   # {store_id: snap}
+    # 任一店 worker 在跑 → False；snap.progress.finished 或 error==no_resume_state → 无活可干
+
+def switch_to_new():      # 任一步失败返回 False（先停后启）
     _http_post(f"{OLD_MODULE}/stop?store=all")
     if not wait_worker_stopped(OLD_MODULE):   # 轮询 /status 确认 worker_alive=false
         return False      # 超时未停止 → 放弃本次切换，避免 profile 冲突
@@ -287,28 +303,30 @@ def switch_to_old():
 
 # 守护：切换失败重试 3 次（_switch_with_retry）
 #       停止等待超时 180s（覆盖旧模块优雅停止最坏：首捕 120s + 限流暂停 30s）
-#       新模块窗口内每分钟补发旧模块 /stop，防旧宿主 AUTO_START/崩溃重启复活 worker
+#       新模块该跑时每分钟补发旧模块 /stop，防旧宿主 AUTO_START/崩溃重启复活 worker
 #       主循环 try/except 包裹，单次异常不杀死协调器进程
 ```
 
 **切换机制：主循环决策（每 60s 一轮）**
 
 1. 写心跳文件；
-2. `_pending_new_tasks()`：新模块 `/status` 的 `pending_task_count == 0` → 无数据：若新 worker 活着则 `switch_to_old`，旧模块 100% 跑，本轮结束；
-3. 有数据 + **在新窗口内**（`NEW_START_HOUR ≤ 当前小时 < NEW_START_HOUR + NEW_HOURS`）：
+2. `_new_work_pending_today()`：新模块 `/status` 的 `pending_task_count > 0` 且 `today_done == False` → 今日 nmID 轮次未完成：
    - 旧 worker 活着 → 先补发旧模块 `/stop?store=all`（**持续压制**，防旧宿主 AUTO_START/崩溃重启复活 worker 抢 profile）；
    - 新 worker 不在跑 → `switch_to_new`；
-4. 有数据 + **窗口外**：
+3. 否则（今日已完成 或 无待处理数据）→ 巡检时段：
    - 新 worker 活着 → `switch_to_old`；
-   - 否则旧 worker 也不在跑 → 补发旧模块 `/resume?store=all`（旧模块猝死后拉活）；
-5. sleep 60s；单轮异常被 try/except 接住，不致死协调器。
+   - 否则旧 worker 也不在跑且 `_old_runnable()` 为真 → 补发旧模块 `/resume?store=all`（旧模块猝死/被停后拉活；已拉完则不空转）；
+4. sleep 60s；单轮异常被 try/except 接住，不致死协调器。
+
+> 日界完全由新模块驱动：`today_done` 每次 `/status` 从磁盘 `state.json`（`round_date`+`finished`）现算，
+> BJT 午夜后自然翻 False，协调器无需自己判时间窗。
 
 **单次切换的完整序列（以 OLD→NEW 为例，`switch_to_new`）**
 
 1. `POST 旧模块/stop?store=all` → 失败则记 `FAILED(old /stop failed)` 返回；
 2. `wait_worker_stopped(旧模块)`：每 2s 轮询 `/status` 直到 `worker_alive=false`，上限 `STOP_WAIT_TIMEOUT=180s` → 超时则**放弃本次切换**（记 `FAILED(old stop timeout)`），**不强行 resume 新模块**，避免两个 Chrome 抢同一 profile；
 3. `POST 新模块/resume` → 失败则记 `FAILED(new /resume failed)` 返回；
-4. 全程成功 → 记 `OK`（方向 `OLD->NEW`，备注窗口时段）。
+4. 全程成功 → 记 `OK`（方向 `OLD->NEW`，备注“今日轮次未完成”）。
 
 `switch_to_old`（NEW→OLD）为镜像序列：新模块 `/stop` → 等停 180s → 旧模块 `/resume?store=all`。
 
@@ -322,9 +340,9 @@ def switch_to_old():
 ### 9.4 对旧模块的影响
 
 - **代码零改动**：协调器只调用旧模块已有的 `/stop` `/resume` HTTP 接口
-- **数据不丢失**：旧模块 stop 时保存断点，resume 从断点继续
-- **变慢**：旧模块在新模块窗口（每天 12h）暂停，其余 12h 全速跑；断点续传不丢数据（已确认接受）
-- **启动开销**：每次 resume 增加 10-30 秒（重启 Chrome + 选店 + 捕获请求）；天级窗口下每天仅 2 次切换（00:00/12:00），相对 12h 窗口占比 <0.1%，可忽略（旧文“约 2.8%”为分钟级轮转口径，已废弃）
+- **数据不丢失**：旧模块 stop 时保存断点，resume 从断点继续；巡检未完成保留 cursor 断点下次继续
+- **时段变化**：旧模块在当天 nmID 轮次跑完（约 15-16h）后才接手，跑剩余约 8-9h；新模块跑时旧模块暂停，断点续传不丢数据
+- **启动开销**：每次 resume 增加 10-30 秒（重启 Chrome + 选店 + 捕获请求）；完成驱动下每天典型仅 2 次切换（nmID 跑完切旧 / 次日午夜切新），占比可忽略
 
 ### 9.5 快速切换方式
 

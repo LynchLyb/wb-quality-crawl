@@ -23,7 +23,7 @@ import time
 
 import config
 from script import PAGE_URL, create_driver
-from wb_to_oss import convert_and_upload_shard, oss_target
+from wb_to_oss import convert_and_upload_shard, oss_target, oss_today
 from nmid_fetch import oss_input   # 复用 INPUT_VARIANT：产出分片名带变体标记，与 A 机 001/control 区分
 
 # 复用旧模块的通用能力（选店/捕获/调接口/清理/锁），不复制代码
@@ -78,9 +78,10 @@ def store_id_for_seller(seller_id):
 
 # ---------------------------------------------------------------- 断点状态
 def save_state(run_dir, run_ts, shard_index, query_count, matched_count,
-               processed_index, finished=False):
+               processed_index, finished=False, round_date=None):
     state = {
         "run_ts": run_ts,
+        "round_date": round_date,       # 本轮所属 BJT 日期；配合 finished 落盘“当天已完成”，防重启/看门狗重复跑
         "shard_index": shard_index,
         "query_count": query_count,
         "matched_count": matched_count,
@@ -103,18 +104,14 @@ def load_state(run_dir):
         return None
 
 
-def reset_state_for_new_round(run_dir):
-    """一轮跑完后重置断点，让下一轮从头查询（每次全量处理）。"""
-    st = load_state(run_dir)
-    if st is None:
-        return
-    st["finished"] = False
-    st["processed_index"] = 0
-    st["query_count"] = 0
-    st["matched_count"] = 0
-    st["shard_index"] = 1
-    with open(os.path.join(run_dir, "state.json"), "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=2)
+def is_round_done_today(store_id, task_id, today=None):
+    """该 (store, task) 今日一轮是否已完整跑完（以磁盘 state.json 为准）。
+
+    判据：finished=True 且 round_date==今天(BJT)。重启/看门狗拉起后据此跳过当天重复抓取。
+    """
+    today = today or oss_today()
+    st = load_state(_run_dir(store_id, task_id))
+    return bool(st and st.get("finished") and st.get("round_date") == today)
 
 
 # ---------------------------------------------------------------- 分片与上传
@@ -179,26 +176,34 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
     def _stopped():
         return stop_event is not None and stop_event.is_set()
 
-    # 断点续传
+    # 断点续传 + 日级轮次语义（BJT 日界，与 OSS 归档日期同口径）
+    today = oss_today()
     run_ts = time.strftime("%Y%m%d_%H%M%S")
     processed_index = 0
     shard_index = 1
     query_count = 0
     matched_count = 0
+    round_date = today   # 本轮归属日：新轮=今天；在途轮次续传时沿用起始日，不重置
     buffer = []          # 命中缓存；提前初始化，确保选店/捕获失败提前 return 时 finally 能安全引用（否则 UnboundLocalError 且漏掉 driver.quit）
     st = load_state(run_dir) if resume else None
-    if st and not st.get("finished"):
+    if st and st.get("finished"):
+        if st.get("round_date") == today:
+            # 今日一轮已完整跑完 → 跳过（落盘标记防重启/看门狗当天重复跑）
+            print(f"[DAILY] 今日({today})该任务已完成，跳过")
+            result["finished"] = True
+            return result
+        # 上一轮完成于往日 → 跨天开新一轮（计数器保持归零，round_date=今天）
+        print(f"[DAILY] 新一轮 nmID：上轮完成于 {st.get('round_date')}，今日 {today} 从头跑")
+    elif st and not st.get("finished"):
+        # 在途轮次（当日中断或跨天未完成）→ 断点续传，round_date 沿用起始日，绝不重置丢进度
         run_ts = st.get("run_ts", run_ts)
         processed_index = st.get("processed_index", 0)
         shard_index = st.get("shard_index", 1)
         query_count = st.get("query_count", 0)
         matched_count = st.get("matched_count", 0)
+        round_date = st.get("round_date", today)
         print(f"[RESUME] 从断点继续: processed_index={processed_index}, "
-              f"shard={shard_index}, query={query_count}")
-    elif st and st.get("finished"):
-        print("[RESUME] 该任务已完成，跳过")
-        result["finished"] = True
-        return result
+              f"shard={shard_index}, query={query_count}, round_date={round_date}")
 
     # OSS 上传目标
     bucket, prefix, oss_err = oss_target(oss_segment=store["oss_segment"])
@@ -358,7 +363,7 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
                 buffer = []
                 on_shard_written(spath)
                 save_state(run_dir, run_ts, shard_index, query_count,
-                           matched_count, processed_index)
+                           matched_count, processed_index, round_date=round_date)
 
             # 自适应睡眠：把“请求发起间隔”钉在 base_interval（闭环退避动态值，floor=CALL_INTERVAL）
             # ——慢请求少睡/不睡，快请求补足余量；撞 429 时 base 抬高把 surge 摁住
@@ -376,7 +381,7 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
                 buffer, shard_index, run_ts, task_id, seller_id, run_dir)
             on_shard_written(spath)
         save_state(run_dir, run_ts, shard_index, query_count, matched_count,
-                   processed_index, finished=result["finished"])
+                   processed_index, finished=result["finished"], round_date=round_date)
         # 写汇总
         summary = {
             "task_id": task_id, "seller_id": seller_id, "store_id": store_id,
@@ -420,6 +425,9 @@ def process_task(store, task_id, seller_id, resume=True, stop_event=None, progre
     nmids = oss_input.parse_nmids(local_csv)
     print(f"[INPUT] taskId={task_id} sellerId={seller_id} 共 {len(nmids)} 个 nmID")
     if not nmids:
+        # 空 CSV 也落盘“今日已完成”，否则无 state 会永远拖住 today_done
+        save_state(_run_dir(store_id, task_id), time.strftime("%Y%m%d_%H%M%S"),
+                   1, 0, 0, 0, finished=True, round_date=oss_today())
         return {"finished": True, "error": "empty_csv"}
     return run_nmid_fetch(store, task_id, seller_id, nmids,
                           resume=resume, stop_event=stop_event, progress=progress)

@@ -11,8 +11,6 @@ import os
 import urllib.request
 from datetime import datetime
 
-from nmid_fetch.coordinator import NEW_HOURS, NEW_START_HOUR
-
 OLD_MODULE = "http://127.0.0.1:8080"
 NEW_MODULE = "http://127.0.0.1:8081"
 HEARTBEAT_FILE = os.path.join(
@@ -70,8 +68,9 @@ def main():
     new_up = "_error" not in new_health
     new_worker = new_status.get("worker_alive") if isinstance(new_status, dict) else None
     pending = new_status.get("pending_task_count") if isinstance(new_status, dict) else None
+    today_done = new_status.get("today_done") if isinstance(new_status, dict) else None
     rows.append(("新模块 (8081)", "存活" if new_up else f"不可达({new_health.get('_error')})",
-                 _fmt(new_worker), f"按nmID (待处理task={pending})"))
+                 _fmt(new_worker), f"按nmID (待处理task={pending}, 今日完成={today_done})"))
 
     # 协调器（心跳文件）
     coord_state = "未运行"
@@ -86,7 +85,7 @@ def main():
         except (OSError, ValueError):
             coord_state = "心跳异常"
     rows.append(("协调器", coord_state, "-",
-                 f"天级轮转 新{NEW_HOURS}h/旧{24 - NEW_HOURS}h（{NEW_START_HOUR:02d}:00 起）"))
+                 "完成驱动：新模块今日未完成→跑新，完成→旧模块巡检"))
 
     # 打印表格
     print(f"{'组件':<16}{'HTTP/进程':<24}{'Worker':<10}{'说明'}")
