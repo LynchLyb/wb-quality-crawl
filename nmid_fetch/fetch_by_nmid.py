@@ -39,6 +39,7 @@ from fetch_all import (
     ensure_selected_store, verify_selected_store,
 )
 from nmid_fetch import oss_input
+from nmid_fetch import profile_heal
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -329,6 +330,11 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
         upload_threads.append(t)
         t.start()
 
+    # buffer 必须在 try 之前初始化：掉线/选店失败会在 try 内提前 return，而 finally 会
+    # 引用 buffer 落盘剩余分片；若留到 try 内赋值会触发 UnboundLocalError——历史上掉线
+    # 真因（not_logged_in）就是被这个崩溃盖住、只看到 buffer 报错。
+    buffer = []
+
     # 启动浏览器
     pre_launch_cleanup(store["profile_dir"])
     _prog(status="launching_browser", store_id=store_id, task_id=task_id)
@@ -337,6 +343,16 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
     driver.get(PAGE_URL)
 
     try:
+        # 掉线检测：落地 URL 被重定向到登录/鉴权页 => 该店 profile 登录态失效。
+        # 干净地报 not_logged_in，交上层触发兄弟店克隆自愈（不再让"下拉框展不开"掩盖真因）。
+        time.sleep(3)
+        _cur_url = driver.current_url or ""
+        if profile_heal.looks_logged_out(_cur_url):
+            print(f"[AUTH] {store_id} 登录态失效（落地 {_cur_url}）")
+            _prog(status="auth_failed", last_error="not_logged_in")
+            result["error"] = "not_logged_in"
+            return result
+
         # 自动选店
         expected_id = config.get_seller_id(store_id)
         switched = False
@@ -378,7 +394,6 @@ def run_nmid_fetch(store, task_id, seller_id, nmids, resume=True,
             except json.JSONDecodeError:
                 body_template = None
 
-        buffer = []
         consecutive_fail = 0
         server_fail = 0
         base_interval = CALL_INTERVAL   # 闭环退避动态间隔，起始 = floor

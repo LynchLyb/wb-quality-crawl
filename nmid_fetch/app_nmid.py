@@ -22,6 +22,7 @@ from waitress import serve
 
 import config
 from nmid_fetch import oss_input
+from nmid_fetch import profile_heal
 from nmid_fetch.singleton import single_instance_or_exit
 from nmid_fetch.fetch_by_nmid import (
     _lock_file, _run_dir, control_already_done, download_input, load_control_ledger,
@@ -166,6 +167,7 @@ def _main_loop():
         round_done = True
         worked = False
         treatments = []
+        healthy_this_round = set()   # 本轮证实登录态有效的店，掉线自愈时优先作克隆源
         for j, local_csv in queue:
             if _stop_event.is_set():
                 return
@@ -184,7 +186,24 @@ def _main_loop():
                                  stop_event=_stop_event, progress=_progress,
                                  variant=j["variant"], index=j["index"],
                                  oss_key=j["key"], row=j, local_csv=local_csv)
+                # 掉线自愈：任务报登录态失效 → 从健康兄弟店克隆 profile 后就地重试一次。
+                # 优先用本轮已证实健康的店作源（免探针），否则探针其余兄弟店。
+                if r.get("error") in profile_heal.AUTH_HEAL_ERRORS and not _stop_event.is_set():
+                    srcs = [s for s in healthy_this_round if s != store_id]
+                    print(f"[HEAL] {store_id} 掉线（{r.get('error')}），尝试兄弟店克隆自愈"
+                          f"（本轮已知健康源: {srcs or '无，需探针'}）")
+                    ok, src = profile_heal.heal_from_sibling(store_id, preferred=srcs)
+                    if ok and not _stop_event.is_set():
+                        print(f"[HEAL] {store_id} 克隆自 {src} 成功，重试本任务")
+                        r = process_task(store, j["task_id"], j["seller_id"], resume=True,
+                                         stop_event=_stop_event, progress=_progress,
+                                         variant=j["variant"], index=j["index"],
+                                         oss_key=j["key"], row=j, local_csv=local_csv)
                 worked = True
+                # 非掉线且确实与 WB 通过信（跑完或有查询）→ 记为本轮健康克隆源候选
+                if r.get("error") not in profile_heal.AUTH_HEAL_ERRORS and (
+                        r.get("finished") or r.get("query_count", 0) > 0):
+                    healthy_this_round.add(store_id)
                 if not r.get("finished"):
                     round_done = False
                 elif j["variant"] == "treatment":

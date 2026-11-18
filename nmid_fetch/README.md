@@ -27,6 +27,7 @@
 | `__init__.py` | 包标识 |
 | `fetch_by_nmid.py` | 主脚本：按 nmID 查询 + 分片上传 + control 台账 |
 | `oss_input.py` | OSS 输入文件扫描/命名解析/规则编排（`plan_round`）/下载 |
+| `profile_heal.py` | 掉线自愈：登录态失效时从健康兄弟店克隆 Chrome profile |
 | `app_nmid.py` | Flask 宿主入口（可选，或直接跑 fetch_by_nmid.py） |
 
 ## 运行
@@ -84,6 +85,26 @@
 **扩展性**
 
 - 单店 ~30,000 条/天为串行上限；**多店铺可并行**（每店独立账号 + 独立浏览器 profile），日产量近似线性叠加。
+
+## 掉线自愈（兄弟店克隆登录态）
+
+多店共用**同一个 WB 账号**，但每店用各自独立的 Chrome profile（cookie 隔离、各自独立老化），因此常见「部分店掉线、部分店仍在线」。DPAPI cookie 绑定 Windows 用户而非目录，同机同用户下把一个健康店的 profile 复制给掉线店即可免人工重登。
+
+**触发链**（`profile_heal.py` + `fetch_by_nmid.py` + `app_nmid.py`）：
+
+1. `fetch_by_nmid` 打开卖家页后先看落地 URL：被重定向到登录/鉴权页（含 `login`/`passport`/`auth`/`signin`/`sso`/`identity`）→ 干净地报 `not_logged_in`；下拉框展不开（登录页无店铺 radio）→ `store_select_open_failed`。两者都在 `AUTH_HEAL_ERRORS` 里。
+2. `app_nmid._main_loop` 收到这两个错误码 → 调 `heal_from_sibling(store_id, preferred=本轮已知健康店)`：优先用本轮证实健康的兄弟店直接克隆（免探针），否则逐个探针（`probe_logged_in` 开浏览器实测）其余配了卖家 ID 的店，从第一个在线的克隆。
+3. 克隆成功 → **就地重试本任务一次**（`resume=True`，从断点续，不丢数据）。克隆后抓取前自动选店（`ensure_selected_store`）会把下拉框切回掉线店自己的目标卖家 ID，故克隆来的会话停在源店也不影响。
+
+**安全边界**：
+
+- 只在**确认源店当前已登录**后才克隆（本轮已知健康 or 探针实测），绝不把死会话扩散；
+- 克隆前 `pre_launch_cleanup` 目标店残留 chrome，并排除 `lockfile`/`DevToolsActivePort`（否则目标店 Chrome 误判「已在运行」）；克隆前备份目标店 Cookies 到 `.preheal.<时间戳>` 以便回滚；
+- 克隆后校验关键文件存在、锁文件不存在、Cookies 的 MD5 与源一致，任一不符即判失败换下一个候选；
+- **每店冷却窗口 `HEAL_COOLDOWN=900s`**：无论成败都置冷却，克隆失败不紧凑重试，交回上层长退避；
+- 全部兄弟店都掉线时自愈失败 → 仍需人工 `login_store.py <store>` 重登。
+
+> 历史坑：`fetch_by_nmid` 的 `buffer` 曾在 `try` 内初始化，而掉线/选店失败会在 `try` 内提前 `return`、`finally` 又引用 `buffer` 落盘 → 触发 `UnboundLocalError`，把真正的掉线真因（`not_logged_in`）盖住，日志里只看得到 `buffer` 报错。现已把 `buffer = []` 提到 `try` 之前修复。
 
 ## 数据接口与返回格式
 

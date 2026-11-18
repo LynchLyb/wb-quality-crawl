@@ -171,6 +171,8 @@ Enable-ScheduledTask  -TaskName 'WB_FetchHost'   # 维护完：恢复登录自�
 | 多店：`last_error=store_mismatch` | 自动切换后复核仍与 `config.json` 期望 ID 不符：人工在该店 profile 里手动切到目标店（或核对登录账号）后 `/resume`；终态不自动重启 |
 | 多店：`last_error=store_not_available` | 下拉框里没有 `config.json` 期望的店 ID：该子账号可能无此店权限，核对账号/店铺 ID；终态不自动重启 |
 | 多店：`last_error=store_verify_failed` | 下拉框没展开/没读到/点击切换失败（改版或渲染慢）：看日志 `[SELECT]`/`[VERIFY]` 行，必要时更新选择器；终态不自动重启 |
+| nmid：某店掉线（`last_error=not_logged_in`/`store_select_open_failed`） | **已自动自愈**：`app_nmid._main_loop` 调 `profile_heal.heal_from_sibling` 从同账号健康兄弟店克隆 profile（优先本轮已知健康店、否则探针实测），克隆后就地重试本任务一次；看日志 `[HEAL]` 行。冷却 900s，全兄弟店都掉线时才需人工 `login_store.py <id>` |
+| nmid：日志只报 `UnboundLocalError: buffer` 看不到掉线真因 | 已修复：`buffer = []` 提到 `try` 之前（掉线/选店失败会在 `try` 内提前 return、`finally` 引用 buffer 落盘），不再掩盖 `not_logged_in` |
 | worker 反复重启，`last_error` 含 `UnicodeEncodeError: 'gbk'` | 日志 print 里有非 GBK 字符（emoji ✓/✅/❌）；已在 `fetch_all.py` 顶部 `reconfigure(utf-8, errors=replace, line_buffering=True)` 兜底，print 内禁用 emoji（用 `[OK]`/`[X]`/`*`），中文 GBK 可编码不受影响 |
 | `host_new.log` 0 字节但 `/status` 正常在爬 | `Start-Process -WindowStyle Hidden -RedirectStandardOutput` 不落盘（PS 坑）；改 `-NoNewWindow`，或 `python -u app.py > host_new.log 2>&1` |
 | 宿主下线后 ≤2 分钟又被自动拉起（想维护却复活） | `WB_FetchHost` 每 2 分钟重复触发 = 进程级看门狗；`user_stopped` 是内存态、宿主一死即失效 | 维护前 `Disable-ScheduledTask WB_FetchHost`，维护完 `Enable-ScheduledTask WB_FetchHost`；`/stop` 停不住整个宿主 |
