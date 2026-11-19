@@ -31,6 +31,11 @@ tableListv6_*/
 nmid_data/
 nmID.txt
 
+# ---- wb_querywords 搜索词推荐抓取：OSS input 下载副本 / 输出分片&合并(按类型子目录) / 台账 ----
+wb_querywords/input/
+wb_querywords/output/
+wb_querywords/uploaded.json
+
 # ---- 日志 ----
 *.log
 
