@@ -30,13 +30,16 @@ from wb_querywords.api_client import RecoClient
 
 
 class DailyWorker:
-    def __init__(self, store_id=None, resume=False, progress=None):
+    def __init__(self, store_id=None, resume=False, progress=None, one_shot=False):
         self.store_id = store_id or config.STORE_ID
         self.resume = resume
+        self.one_shot = one_shot          # True：跑完当天 input 或命中日配额即退出（供计划任务链批处理调用）
         self.progress = progress if progress is not None else {"snap": {}}
         self._stop_event = threading.Event()
         self._writers = {}
         self._last_scan = 0.0
+        self._quota_exhausted = False      # 命中 limitExceeded（日配额用尽）置真，run 循环据此退出
+        self._pass_done = False            # one_shot 下当天 input 全部处理完置真
 
     def stop(self):
         self._stop_event.set()
@@ -51,6 +54,7 @@ class DailyWorker:
                         processed_index=0, error=None, last_error=None)
         bucket = None
         err_streak = 0
+        auth_rounds = 0            # 连续 auth_failed 轮数（成功或其它状态清零）
         while not self._stop_event.is_set():
             try:
                 if bucket is None:
@@ -58,9 +62,31 @@ class DailyWorker:
                     print("[OSS] bucket 就绪")
                 err_streak = 0
                 self._ensure_current(bucket)
-                if self.progress["snap"].get("status") in ("waiting_input", "error"):
+                st_now = self.progress["snap"].get("status")
+                if st_now == "waiting_input":
+                    if self.one_shot:
+                        print("[BATCH] 无可用 input，退出")
+                        break
+                    continue
+                if st_now == "error":
                     continue
                 self._process_current(bucket)
+                if self._quota_exhausted:
+                    print("[QUOTA] 命中每日对比推荐配额上限，本轮收尾退出（未跑完的词留待明日重置后补）")
+                    break
+                if self.one_shot and self._pass_done:
+                    print("[BATCH] 当天 input 已全部处理完，退出")
+                    break
+                # auth_failed（登录态失效/账号冻结）：不再无限退避，连续达阈值即存断点退出进程
+                if self.progress["snap"].get("status") == "auth_failed":
+                    auth_rounds += 1
+                    stop_at = 1 if self.one_shot else config.AUTH_FAIL_STOP_ROUNDS
+                    if auth_rounds >= stop_at:
+                        print(f"[AUTH] 连续 {auth_rounds} 轮 auth_failed（one_shot={self.one_shot} 阈值={stop_at}）："
+                              f"存断点退出进程，词不丢；恢复登录态后常驻 /resume、批处理待次日链再跑")
+                        break
+                else:
+                    auth_rounds = 0
             except Exception as exc:
                 err_streak += 1
                 backoff = min(600, 15 * err_streak)
@@ -211,40 +237,78 @@ class DailyWorker:
                     break
 
                 if processed >= total:
-                    # 当前 input 跑完：不上传，等被更新 input 取代
+                    # 当前 input 跑完
+                    if self.one_shot:
+                        self._pass_done = True
+                        return
+                    # 常驻模式：不上传，等被更新 input 取代
                     state._set_snap(self.progress, status="idle_done", processed_index=processed)
                     self._sleep(20)
                     continue
 
                 search_text = pairs[processed][0]
                 recom = config.RECOM_TYPES[recom_idx]
-                status, recs, raw = client.query(search_text, recom)
+                status, recs, raw, error_text = client.query(search_text, recom)
 
                 if 200 <= status < 300:
                     auth_fail = 0
-                    clean_streak += 1
-                    if clean_streak >= config.CLEAN_STREAK and interval > config.CALL_INTERVAL:
-                        interval = config.CALL_INTERVAL
-                        print(f"[RATE] 连续成功满 {config.CLEAN_STREAK}，interval 缩回 {interval}s")
-                    self._record(recom, search_text, recs or [], writers, shard_index, calls)
-                    row_retry.pop((processed, recom_idx), None)
-                    recom_idx += 1
-                    if recom_idx >= len(config.RECOM_TYPES):
-                        processed += 1
-                        recom_idx = 0
-                    state.save_state(cur, processed, recom_idx, snapshot())
-                    state._set_snap(self.progress, status="running", processed_index=processed,
-                                    total_rows=total, current_recom_index=recom_idx, interval=interval)
+                    if error_text and "limitExceeded" in error_text:
+                        # 每日对比推荐配额已用尽：不写占位、不前进（词留待明日重置后补），存断点后收尾退出
+                        print(f"[QUOTA] limitExceeded 命中 '{search_text[:40]}'（{recom}）：当天配额用尽，存断点退出")
+                        state.save_state(cur, processed, recom_idx, snapshot())
+                        state._set_snap(self.progress, status="quota_exhausted",
+                                        last_error="content.analytics.limitExceeded",
+                                        processed_index=processed, total_rows=total)
+                        self._quota_exhausted = True
+                        return
+                    if error_text:
+                        # 其它业务错误（非配额）：按单行重试上限处理，超限写空占位前进
+                        key = (processed, recom_idx)
+                        n = row_retry.get(key, 0) + 1
+                        row_retry[key] = n
+                        clean_streak = 0
+                        if n >= config.MAX_RETRY_PER_ROW:
+                            print(f"[SKIP] ({processed},{recom}) '{search_text[:40]}' 业务错误 "
+                                  f"errorText={error_text[:60]} 连续 {n} 次，写空占位并前进")
+                            self._record(recom, search_text, [], writers, shard_index, calls)
+                            row_retry.pop(key, None)
+                            recom_idx += 1
+                            if recom_idx >= len(config.RECOM_TYPES):
+                                processed += 1
+                                recom_idx = 0
+                            state.save_state(cur, processed, recom_idx, snapshot())
+                        else:
+                            print(f"[WARN] ({processed},{recom}) 业务错误 errorText={error_text[:60]} "
+                                  f"retry={n}/{config.MAX_RETRY_PER_ROW}")
+                    else:
+                        # 真成功（含 data=[] 真空结果，正常写占位并前进）
+                        clean_streak += 1
+                        if clean_streak >= config.CLEAN_STREAK and interval > config.CALL_INTERVAL:
+                            interval = config.CALL_INTERVAL
+                            print(f"[RATE] 连续成功满 {config.CLEAN_STREAK}，interval 缩回 {interval}s")
+                        self._record(recom, search_text, recs or [], writers, shard_index, calls)
+                        row_retry.pop((processed, recom_idx), None)
+                        recom_idx += 1
+                        if recom_idx >= len(config.RECOM_TYPES):
+                            processed += 1
+                            recom_idx = 0
+                        state.save_state(cur, processed, recom_idx, snapshot())
+                        state._set_snap(self.progress, status="running", processed_index=processed,
+                                        total_rows=total, current_recom_index=recom_idx, interval=interval)
 
                 elif status in (401, 403):
                     auth_fail += 1
                     print(f"[AUTH] HTTP {status}（连续 {auth_fail}）登录态可能失效")
                     if auth_fail >= 3:
-                        print("[AUTH] 连续 3 次，停止 client 等待退避重试")
                         state.save_state(cur, processed, recom_idx, snapshot())
                         state._set_snap(self.progress, status="auth_failed",
                                         last_error=f"HTTP {status} 连续 {auth_fail} 次")
-                        self._sleep(300)
+                        if self.one_shot:
+                            print("[AUTH] 连续 3 次且为批处理模式：存断点立即退出（登录态失效/账号冻结，"
+                                  "不空睡，交由主循环收口、次日链再试）")
+                        else:
+                            print("[AUTH] 连续 3 次，停止 client，300s 退避后由主循环判是否达停止轮数")
+                            self._sleep(300)
                         return
                 elif status == 429:
                     interval = min(interval * 2, config.BACKOFF_CAP)
@@ -311,6 +375,18 @@ class DailyWorker:
             state._set_snap(self.progress, status="switched", input_date=max_date)
             return True
         return False
+
+    # ------------------------------------------------------------ 睡眠（可被 stop 打断）
+    def _sleep(self, seconds):
+        """分段睡眠 seconds 秒，其间若收到 stop_event 立即返回，保证优雅停止不卡长睡。"""
+        if seconds <= 0:
+            return
+        end = time.time() + seconds
+        while not self._stop_event.is_set():
+            remain = end - time.time()
+            if remain <= 0:
+                break
+            time.sleep(min(1.0, remain))
 
     # ------------------------------------------------------------ 收尾
     def _finish(self, reason):

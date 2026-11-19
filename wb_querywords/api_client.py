@@ -114,10 +114,12 @@ class RecoClient:
 
     # ------------------------------------------------------------ 调用
     def query(self, search_text, recom_type):
-        """单次推荐词查询。返回 (status_int, parsed_list_or_None, raw_text)。
+        """单次推荐词查询。返回 (status_int, parsed_list_or_None, raw_text, error_text)。
 
         响应结构（实测）: {"error": false, "errorText": "", "data": [{nmID,title,mainPhoto,...}, ...]}
-        parsed_list 即 data 数组（每条推荐一个 dict）；失败/非 200/error=true 时为 None。
+        - parsed_list 即 data 数组（每条推荐一个 dict）；失败/非 200/error=true 时为 None。
+        - error_text：2xx 且 error=true 时为响应里的 errorText（如 content.analytics.limitExceeded，
+          表示每日对比推荐配额已用尽）；其余情况为空串 ""。调用方据此区分"配额限流/业务错误/真空结果"。
         """
         if self.driver is None or self.headers is None:
             raise RuntimeError("RecoClient 未启动")
@@ -125,14 +127,17 @@ class RecoClient:
         post = json.dumps(body, ensure_ascii=False)
         status, text = call_api(self.driver, config.RECO_URL, "POST", self.headers, post)
         recs = None
+        error_text = ""
         if 200 <= status < 300:
             try:
                 j = json.loads(text)
             except (json.JSONDecodeError, TypeError):
                 j = None
             if isinstance(j, dict):
-                # error=true 视为业务失败，不解析
-                if not j.get("error"):
+                if j.get("error"):
+                    # 业务错误：透出 errorText 交调用方分类（配额/其它）
+                    error_text = str(j.get("errorText") or "")
+                else:
                     data = j.get("data")
                     if isinstance(data, list):
                         recs = data
@@ -140,5 +145,5 @@ class RecoClient:
                         recs = data["recommendations"]
                     elif isinstance(j.get("recommendations"), list):
                         recs = j["recommendations"]
-        return status, recs, text
+        return status, recs, text, error_text
 
