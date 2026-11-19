@@ -4,13 +4,14 @@
     wb_querywords 每日串行链：先跑搜索词 batch 用完当日推荐配额，再交回 fetch_all。
 
 .DESCRIPTION
-    背景：推荐接口每日仅 100 次硬配额，且 wb_querywords 与 fetch_all 共用 store1
-    的 Chrome profile，二者不能并行，必须串行。故不用 wb_querywords 常驻宿主，改由
-    本脚本每日串三步：
-        1) 优雅停 fetch_all worker（POST /stop），等它退出释放 store1 profile；
-        2) 跑 python -m wb_querywords.batch（one_shot）：跑完当天 input 或命中
-           limitExceeded（日配额用尽）即自动退出进程；
-        3) 重新拉起 fetch_all worker（POST /start?resume=1）继续几小时的大拉。
+    背景：推荐接口每店每日仅 100 次硬配额（按店计），且 wb_querywords 与 fetch_all
+    会共用同一批店铺的 Chrome profile，二者不能并行，必须串行。故不用 wb_querywords
+    常驻宿主，改由本脚本每日串三步：
+        1) 优雅停回退链各店的 fetch_all worker（逐个 POST /stop），等它们退出释放各自 profile；
+        2) 跑 python -m wb_querywords.batch（one_shot）：多店接力——当前店跑完当天 input 或
+           命中 limitExceeded 就自动切回退链下一个店从同一个词继续；全部店配额用尽或跑完当天
+           即自动退出进程（退出前跑完即上传当前日期）；
+        3) 重新拉起各店 fetch_all worker（逐个 POST /start?resume=1）继续几小时的大拉。
 
     部署前提：
         - WB_FetchHost（8080 常驻宿主，AUTO_START + 巡检自愈）保持启用；
@@ -30,7 +31,9 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot    = "C:\Users\yuanbo\PycharmProjects\WelcomeScreen"  # 项目根目录
 $Python         = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $FetchHostBase  = "http://127.0.0.1:8080"   # fetch_all 常驻宿主（根 app.py）
-$Store          = "store1"                  # 两模块共用的店铺 profile
+# 多店接力：batch 会先后起回退链里每个店的浏览器（各用独立 profile），故必须把
+# 这些店的 fetch_all worker 都先停下释放 profile，跑完 batch 再全部拉起。需与 wb_querywords/config.py 的 STORE_IDS 对齐。
+$Stores         = @("store1", "store2")      # 接力回退链涉及的全部店 profile
 $StopTimeoutSec = 180                       # 等 fetch_all worker 优雅退出的上限（秒）
 # ============================
 
@@ -46,26 +49,32 @@ function Log($msg) {
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 Set-Location $ProjectRoot
 
-Log "===== 每日链开始（store=$Store）====="
+Log "===== 每日链开始（stores=$($Stores -join ',')）====="
 
-# ---- 1. 优雅停 fetch_all worker，释放 store1 profile ----
+# ---- 1. 优雅停回退链各店的 fetch_all worker，释放各自 profile ----
 $stopped = $true
 try {
-    Invoke-RestMethod -Method Post -Uri "$FetchHostBase/stop?store=$Store" | Out-Null
-    Log "已请求 fetch_all /stop，等待 worker 退出（最多 ${StopTimeoutSec}s）..."
+    foreach ($st in $Stores) {
+        Invoke-RestMethod -Method Post -Uri "$FetchHostBase/stop?store=$st" | Out-Null
+        Log "已请求 fetch_all /stop store=$st"
+    }
+    Log "等待所有 worker 退出（最多 ${StopTimeoutSec}s）..."
     $deadline = (Get-Date).AddSeconds($StopTimeoutSec)
-    $alive = $true
+    $stillAlive = $true
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 5
-        $s = Invoke-RestMethod -Uri "$FetchHostBase/status?store=$Store"
-        $alive = [bool]$s.worker_alive
-        if (-not $alive) { break }
+        $anyAlive = $false
+        foreach ($st in $Stores) {
+            $s = Invoke-RestMethod -Uri "$FetchHostBase/status?store=$st"
+            if ([bool]$s.worker_alive) { $anyAlive = $true }
+        }
+        if (-not $anyAlive) { $stillAlive = $false; break }
     }
-    if ($alive) {
+    if ($stillAlive) {
         $stopped = $false
-        Log "[X] fetch_all worker 在 ${StopTimeoutSec}s 内仍未退出；为不抢 store1 profile，本轮跳过 batch"
+        Log "[X] fetch_all worker 在 ${StopTimeoutSec}s 内仍未全部退出；为不抢 profile，本轮跳过 batch"
     } else {
-        Log "[OK] fetch_all worker 已停止，store1 profile 已释放"
+        Log "[OK] fetch_all worker 已全部停止，profile 已释放"
     }
 } catch {
     # 宿主没在跑 / 端口不通：视为没有 worker 占用，继续跑 batch
@@ -92,10 +101,12 @@ if ($stopped) {
     Log "[!] 因 fetch_all 未让出 profile，本轮未跑 batch"
 }
 
-# ---- 3. 重新拉起 fetch_all worker 继续大拉 ----
+# ---- 3. 重新拉起回退链各店的 fetch_all worker 继续大拉 ----
 try {
-    Invoke-RestMethod -Method Post -Uri "$FetchHostBase/start?store=$Store&resume=1" | Out-Null
-    Log "[OK] 已请求 fetch_all /start?resume=1 续拉"
+    foreach ($st in $Stores) {
+        Invoke-RestMethod -Method Post -Uri "$FetchHostBase/start?store=$st&resume=1" | Out-Null
+        Log "[OK] 已请求 fetch_all /start?resume=1 store=$st 续拉"
+    }
 } catch {
     Log "[!] 拉起 fetch_all 失败（宿主可能没在跑，巡检会自愈）：$($_.Exception.Message)"
 }

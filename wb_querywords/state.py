@@ -6,7 +6,8 @@
       "input_date": "20261117",       # 当前正在跑的 input 日期（一对一决定 output 命名）
       "processed_index": 1234,         # 当前 input 已处理到的行号（0-based）
       "current_recom_index": 0,        # 当前行内已完成的 recomType 数（B 双路用）
-      "shards": {"<recom>": {"shard_index": 1, "calls_in_shard": 37}},  # 各类型分片进度
+      "store_index": 0,                 # 当前跑的回退链店铺下标（STORE_IDS[store_index]）
+      "shards": {"<recom>": {"shard_index": 1, "calls_in_shard": 37}},  # 当前店各类型分片进度
       "updated_at": "2026-11-19 03:12:00"
     }
 
@@ -39,20 +40,22 @@ def load_state():
         return {}
 
 
-def save_state(input_date, processed_index, current_recom_index, shards=None):
-    """写断点状态（input_date 为当前 input 日期；shards 为各类型分片进度）。"""
+def save_state(input_date, processed_index, current_recom_index, shards=None, store_index=0):
+    """写断点状态（input_date 为当前 input 日期；shards 为当前店各类型分片进度；
+    store_index 为当前正在跑的回退链店铺下标，崩溃/切日后可恢复到同一店续跑）。"""
     _atomic_write_json(config.STATE_FILE, {
         "input_date": input_date,
         "processed_index": int(processed_index),
         "current_recom_index": int(current_recom_index),
+        "store_index": int(store_index),
         "shards": shards or {},
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
 
 
 def reset_state_for_new_input(input_date):
-    """切到新的 input 日期时归零进度与分片。"""
-    save_state(input_date, 0, 0, shards={})
+    """切到新的 input 日期时归零进度与分片，并回到回退链首店。"""
+    save_state(input_date, 0, 0, shards={}, store_index=0)
 
 
 def acquire_lock():

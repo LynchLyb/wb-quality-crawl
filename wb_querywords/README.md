@@ -1,7 +1,7 @@
 # wb_querywords — 搜索词推荐词抓取方案（纯 input 驱动）
 
 > A 分支（nmid-fetch）实现 `recomType=searchViewItem` 单路；B 分支（nmid-fetch-two）实现 `recomType=searchOrders` 与 `searchAddToCart` 双路。
-> 本目录是**独立抓取器**，与 `nmid_fetch/`（按 nmID 抓商品详情）、根 `fetch_all.py`（全量商品翻页）互不重叠。因推荐接口**每日仅 100 次配额**且与 `fetch_all` **共用 store1 profile**，生产采用**每日串行链**：先跑本模块 batch 用完配额（几分钟），再跑 fetch_all（详见 §4.9），二者不同时抢浏览器。
+> 本目录是**独立抓取器**，与 `nmid_fetch/`（按 nmID 抓商品详情）、根 `fetch_all.py`（全量商品翻页）互不重叠。因推荐接口**每店每日仅 100 次配额**（按店计，多店接力可翻倍）且与 `fetch_all` **共用同一批店铺 profile**，生产采用**每日串行链**：先跑本模块 batch 用完各店配额（几分钟），再跑 fetch_all（详见 §4.9），二者不同时抢浏览器。
 
 ---
 
@@ -43,19 +43,20 @@ B 双路 → 两个 `recomType` 各写各的临时分片、各合并到各自的
 wb_querywords/
   __init__.py
   config.py         # 常量 + 路径/OSS key 助手
-  state.py          # 断点（input_date/processed_index/分片进度）+ 单实例锁
+  state.py          # 断点（input_date/processed_index/分片进度/store_index）+ 单实例锁
   api_client.py     # 切店 → 捕获 analytics-api 头 → 归一化 → POST 循环（复用 _probe_reco3.py 骨架）
-  csv_io.py         # 输入读取（search_request+search_volume，按量降序）/ ShardWriter 临时分片 / merge_shards 合并
+  csv_io.py         # 输入读取（search_request+search_volume，按量降序）/ ShardWriter 按店临时分片 / merge_shards 跨店合并
   oss_uploader.py   # OSS input 列举+下载 / 合并文件上传（output/<类型>/<日期>.csv）/ 上传台账判重
-  worker.py         # 纯 input 驱动主循环 + 每小时重扫 + 切换统一上传 + 429 闭环退避 + limitExceeded 日配额收尾
+  worker.py         # 纯 input 驱动主循环 + 多店接力切店 + 每小时重扫 + 429 闭环退避 + limitExceeded 接力/收尾 + 跑完即上传
   app.py            # Flask 常驻宿主 127.0.0.1:8082  /health /status /stop /resume /start
   batch.py          # 批处理入口（one_shot）：跑完当天 input 或命中日配额即退出，供每日计划任务链调用
   README.md         # 本方案
   input/            # 从 OSS 下载的 input 副本（gitignore）
-  output/           # 按类型分子目录的临时分片 + 合并产物（gitignore，上传源+崩溃恢复）
-    searchViewItem/     # A
-    searchOrders/       # B
-    searchAddToCart/    # B
+  output/           # 类型 > 店 > 分片三层目录 + 合并产物（gitignore，上传源+崩溃恢复）
+    searchViewItem/
+      store1/       # A 店1 接力分片
+      store2/       # A 店2 接力分片
+    searchOrders/、searchAddToCart/   # B（同样按店分子目录）
   state.json        # 断点/分片进度（gitignore）
   uploaded.json     # 已上传台账（gitignore）
   run.lock          # PID 锁（gitignore）
@@ -71,7 +72,7 @@ wb_querywords/
      - `cur` 为空 → 设 `cur=max_date`、下载 input、归零断点。
      - `cur < max_date` → 统一上传 `cur` → 切 `max_date`。
   2. `_process_current`：逐行跑 `cur`；每 `INPUT_SCAN_INTERVAL=3600s` 调 `_rescan_due`，发现更新 input → 统一上传 `cur` → break 回主循环切新日期。
-  3. `cur` 全部跑完 → **不上传**，空转等被更新 input 取代（最新日期的数据要等下一份 input 到达才上传，这是"延迟统一上传"的既定语义）。
+  3. `cur` 全部跑完：**常驻模式不上传**，空转等被更新 input 取代（“延迟统一上传”）；**one_shot/批处理则跑完即上传**当前日期后退出（详见 §4.9）。
 
 ### 4.2 单实例锁
 `state.py` 复用根 `fetch_all.acquire_single_instance / release_single_instance`，锁文件 `wb_querywords/run.lock`。宿主重启、手动 CLI 并发运行都会被 `[LOCK]` 挡下。
@@ -79,13 +80,14 @@ wb_querywords/
 ### 4.3 断点状态
 `state.json`：
 ```
-{"input_date": "20261117", "processed_index": N, "current_recom_index": 0|1,
+{"input_date": "20261117", "processed_index": N, "current_recom_index": 0|1, "store_index": 0|1,
  "shards": {"<recomType>": {"shard_index": i, "calls_in_shard": c}}}
 ```
 - `processed_index`：当前 input 已完成行号；下次从 N 续跑。
 - `current_recom_index`（B 用）：当前行已跑到第几个 recomType（0 起；跑满 len(RECOM_TYPES) 才前进 processed_index）。
-- `shards`：各类型临时分片进度（分片序号从 1 起 + 片内已写调用数）。
-- 切到新 input 日期 → `reset_state_for_new_input` 归零 processed/recom/shards。
+- `shards`：当前店各类型临时分片进度（分片序号从 1 起 + 片内已写调用数；切店时重置）。
+- `store_index`：当前跑的回退链店铺下标（`STORE_IDS[store_index]`），崩溃/重启后恢复到同一店续跑。
+- 切到新 input 日期 → `reset_state_for_new_input` 归零 processed/recom/shards 且 `store_index=0`。
 
 ### 4.4 API 会话生命周期（单浏览器多次调用）
 - 起一个 Chrome：`pre_launch_cleanup` → `create_driver(headless=False, profile_dir)` → `driver.get(PAGE_URL)` → 可选 `ensure_selected_store` 切目标店 → `driver.get(COMPARE_URL)` 触发 `analytics-api` → 40s 轮询 performance log 首捕请求头 → `build_fetch_headers` + 归一化 `content-type: application/json`。
@@ -95,13 +97,16 @@ wb_querywords/
 ### 4.5 限流、退避与日配额处理
 `api_client.query` 返回 `(status, recs, raw, error_text)`，worker 每次调用后按下面分类：
 - `2xx` 且 `error=false` → **成功**（含 `data=[]` 真空，正常写占位行并前进）；连续成功满 `CLEAN_STREAK=50` 把 interval 缩回 `CALL_INTERVAL=1.2`。
-- `2xx` 且 `errorText` 含 `limitExceeded` → **每日配额用尽**：**不写占位、不前进**（当前词/类型留待次日重置后从断点补），存断点后**干净收尾退出进程**（`status=quota_exhausted`）。当天继续重试无意义（硬日限额），交由每日链次日再跑。
+- `2xx` 且 `errorText` 含 `limitExceeded` → **当前店每日配额用尽**：**不写占位、不前进**（当前词不丢）。
+  - 若回退链还有下一个店 → **自动起下一个店从同一个词继续接力**（分片写新店目录，重置该店速率/重试计数）。
+  - 若已是最后一个店 → 全店配额用尽，存断点后 `status=quota_exhausted` 退出（未跑完词留待次日重置后补）。
+  - 配额**按店计**，所以两店接力当日约能跑 ~2×100 词（实测）。
 - `2xx` 且其它 `errorText` → 该 (行,类型) 的持久业务错误，计入单行重试上限（见下）。
 - `429` → interval 翻倍至 `BACKOFF_CAP=300`（这是"手太快"的速率限流，退避后重试同一行）。
 - `401/403` → 连续 3 次视为登录态失效，写断点、`status=auth_failed`、300s 退避（需人工重登，不无限刷）。
 - 其他非 2xx / 非配额业务错误 → 同一 (行,类型) 连续失败满 `MAX_RETRY_PER_ROW=3` 写空占位行并前进（避免单行死循环）。
 
-> 关键区分：**429 = 速率限流**（退避重试可解）；**limitExceeded = 每日配额**（当天不可解，只能次日续）。二者都**不丢词**，但 limitExceeded 会直接结束当天批次。
+> 关键区分：**429 = 速率限流**（退避重试可解）；**limitExceeded = 每店每日配额**（本店当天不可解，但可切下一店接力；全部店用尽才次日续）。二者都**不丢词**。
 
 ### 4.6 Flask 宿主（端口 8082）
 - `AUTO_START=True`（config.py）：宿主进程启动即自动 `_ensure_worker()` 拉起 worker，无需手动 `/resume`；配合计划任务看门狗（宿主被重启→worker 自动回来）实现端到端自愈。`_ensure_worker` 有锁 + `is_alive` 守卫，不会双开。⚠️ `user_stopped` 内存态、不落盘，`/stop` 后若宿主被看门狗重启会被 AUTO_START 重新拉起，长期停用需 `Disable-ScheduledTask WB_QuerywordsHost`。
@@ -110,8 +115,8 @@ wb_querywords/
 - `GET /status` → `{worker_alive, input_date, max_input_date, processed_index, total_rows, current_recom_index, status, last_error, pending_local_dates{类型:[日期]}, uploaded[台账键], state}`。
 
 ### 4.7 分片、合并与统一上传
-- 每次调用**立即** append 到 `output/<类型>/<日期>_<类型>_shard_NNN.csv`（崩溃不丢）。`calls_in_shard` 满 `SHARD_SIZE=100` → 本地滚到下一片（**不上传**）。
-- **统一上传时机**：`_rescan_due` / `_ensure_current` 检测到更新 input（或启动补传）时，对旧日期 `merge_shards(类型, 日期)` 把该类型全部分片合并成 `output/<类型>/<日期>.csv`（单表头 + 全数据行）→ `upload_merged` 传 OSS `wb_querywords/output/<类型>/<日期>.csv` → 成功后删除该日期该类型的临时分片。
+- 每次调用**立即** append 到 `output/<类型>/<store>/<日期>_<类型>_shard_NNN.csv`（按店分目录，崩溃不丢）。`calls_in_shard` 满 `SHARD_SIZE=100` → 本地滚到下一片（**不上传**）。
+- **统一上传时机**：① one_shot 当天跑完/全店配额用尽时**跑完即上传**当前日期；② `_rescan_due`/`_ensure_current` 扫到更新 input（或启动补传）时对旧日期 `merge_shards(类型, 日期)` 把该类型**跨所有店**的分片按店名+片序排序合并成 `output/<类型>/<日期>.csv`（单表头 + 全数据行，接力无重叠拼接即完整）→ `upload_merged` 传 OSS 同一 key（**不含店维度**）→ 成功后删除该日期该类型全部分片。
 - **幂等**：合并上传后分片即删；`uploaded.json` 台账按 `类型/日期.csv` + size 判重；上传失败保留分片下次重试。
 - OSS key 由「类型 + input 日期」决定（一对一），与 `wildberries` 同级、不走 base prefix。
 
@@ -125,16 +130,16 @@ wb_querywords/
 
 `worker.py` / `api_client.py` / `csv_io.py` / `state.py` / `app.py` 完全按 `RECOM_TYPES` 长度自适应，无分支硬编码。
 
-### 4.9 批处理模式与每日计划任务链（与 fetch_all 共存）
-因推荐接口是**每日 100 次硬配额**、且与 `fetch_all` **共用 store1 profile**（不能并行），生产采用**每日串行链**而非 querywords 常驻宿主：
+### 4.9 批处理模式与每日计划任务链（与 fetch_all 共存，多店接力）
+因推荐接口是**每店每日 100 次硬配额**（按店计）、且 `wb_querywords` 与 `fetch_all` **共用同一批店铺 profile**（不能并行），生产采用**每日串行链**而非 querywords 常驻宿主：
 
-- **批处理入口** `python -m wb_querywords.batch`（`one_shot=True`）：从断点续跑当天 input，遇下列任一情况**即退出进程**——① 命中 `limitExceeded`（日配额用尽）；② 当天 input 全部行跑完；③ OSS 无可用 input。退出前存断点、释放单实例锁与 Chrome。
-- **每日计划任务链**（BJT 15:00（下午 3 点）触发）串三步：
-  1. 优雅停 fetch_all（`POST /stop?store=store1`，等 `worker_alive=false`，释放 store1 profile）；
-  2. 跑 `wb_querywords.batch`（约 2~3 分钟用完 100 次配额或跑完当天，自动退出）；
-  3. 重新拉起 fetch_all（`POST /start?store=store1&resume=1`，继续几小时的大拉）。
-- 因此 **`WB_QuerywordsHost`（常驻宿主）在每日链模式下应禁用**，改由链调用 batch；`WB_FetchHost` 保持常驻（AUTO_START+巡检自愈），链只在其间插入几分钟 querywords。
-- batch 与宿主用**同一** `run.lock`，二者不会同时抢 store1；链里"先停 fetch_all 再跑 batch"是跨模块（fetch_all 与 querywords 锁文件不同）必须的人工串行。
+- **多店接力**（`config.STORE_IDS`，如 `["store1","store2"]`）：链首店跑到 `limitExceeded` 后 worker **自动起下一个店、从同一个词继续**（共享游标，词不丢不重），直至当天跑完或全部店配额用尽。接力下当日约能跑 ~2×100 词。
+- **批处理入口** `python -m wb_querywords.batch`（`one_shot=True`）：从断点续跑当天 input，遇下列任一情况**即退出进程**——① **全部店**配额都用尽；② 当天 input 全部行跑完；③ OSS 无可用 input。退出前存断点、**跨店合并上传当前日期**（跑完即上传）、释放锁与 Chrome。
+- **每日计划任务链**（BJT 15:00（下午 3 点）触发）串三步（逐店操作，需与 `STORE_IDS` 对齐）：
+  1. 逐个优雅停各店 fetch_all（`POST /stop?store=<id>`，等**所有店** `worker_alive=false`，释放各自 profile）；
+  2. 跑 `wb_querywords.batch`（多店接力，每店几分钟用完配额，自动退出并上传）；
+  3. 逐个拉起各店 fetch_all（`POST /start?store=<id>&resume=1`，继续几小时的大拉）。
+- 因此 **`WB_QuerywordsHost`（常驻宿主）在每日链模式下应禁用**；`WB_FetchHost` 保持常驻。链里"先停各店 fetch_all 再跑 batch"必须覆盖**回退链涉及的所有店**（接力会先后开多店浏览器）。
 
 ## 5. 提交与部署节奏（本轮约定）
 
@@ -147,5 +152,5 @@ wb_querywords/
 - **input 来自 OSS**：`oss_uploader.list_input_dates` 用 `oss2.ObjectIterator` 列举 `wb_querywords/input/`，`max_input_date` 取最大 `YYYYMMDD`，`download_input` 用 `get_object_to_file` 下到本地 `input/`。OSS 是 input 唯一源，bucket 建不起来则主循环退避重试。
 - **列名识别**：`config.TEXT_COL_CANDIDATES` 优先精确 `search_request`，`VOL_COL_CANDIDATES` 优先精确 `search_volume`（靠候选顺序 + 列位置先后，避开 `avg_daily_search_volume`）。未匹配上表头时按位置回退（第 0 列词、第 1 列量）。实际列名不在候选里，往 `config.py` 相应元组追加即可。
 - **排序兜底**：上游一般已按 `search_volume` 降序；`read_pairs` 再稳定降序一次，相同量保持原顺序；量解析失败按 0 排末尾。
-- **最新日期不落 OSS 的条件**：只有当出现更大日期的 input 时，旧日期才统一上传。若 input 长时间不更新，最新那份会一直留在本地待传（符合"延迟统一上传"设计）。
+- **上传时机**：**批处理（生产链默认）跑完即上传**（当天跑完/全店配额用尽即跨店合并上传）；常驻模式仍保留“延迟统一上传”（只有出现更大日期 input 时旧日期才统一上传）。若 input 长时间不更新且只跑常驻，最新那份会一直留本地待传。
 - **不改现有协调器 / nmid_fetch / fetch_all**：本模块独立，仅通过 Windows 计划任务停掉旧进程达到 exclusive 效果。
