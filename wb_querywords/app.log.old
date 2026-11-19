@@ -1,0 +1,75 @@
+[WQ-HOST] waitress 监听 http://127.0.0.1:8082（store=store1 recom_types=['searchViewItem']）
+[WQ-HOST] AUTO_START 拉起 worker: ok=True worker 已启动
+[OSS] bucket 就绪
+[INPUT] 选定 input 日期 20261117
+[INPUT] 下载 20261117.csv -> C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\input\20261117.csv
+[ROUND] input=20261117 行数=100000 起点 processed_index=0 recom_types=['searchViewItem']
+[CLIENT][X] 启动失败: RuntimeError: 未捕获到 analytics-api 请求头（登录态或页面异常）
+[ERROR] 主循环异常（连续 1 次）: AttributeError: 'DailyWorker' object has no attribute '_sleep' | Traceback (most recent call last):   File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 186, in _process_current     client.start()     ~~~~~~~~~~~~^^   File "C:\Users\
+[ERROR] 15s 后重试
+Exception in thread Thread-1 (_worker_main):
+Traceback (most recent call last):
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 186, in _process_current
+    client.start()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\api_client.py", line 63, in start
+    raise RuntimeError("未捕获到 analytics-api 请求头（登录态或页面异常）")
+RuntimeError: 未捕获到 analytics-api 请求头（登录态或页面异常）
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 59, in run
+    self._process_current(bucket)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 193, in _process_current
+    self._sleep(60)
+    ^^^^^^^^^^^
+AttributeError: 'DailyWorker' object has no attribute '_sleep'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\yuanbo\AppData\Local\Programs\Python\Python314\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\yuanbo\AppData\Local\Programs\Python\Python314\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\app.py", line 63, in _worker_main
+    worker.run()
+    ~~~~~~~~~~^^
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 68, in run
+    self._sleep(backoff)
+    ^^^^^^^^^^^
+AttributeError: 'DailyWorker' object has no attribute '_sleep'
+[OSS] bucket 就绪
+[ROUND] input=20261117 行数=100000 起点 processed_index=0 recom_types=['searchViewItem']
+[WQ][CAP] GET https://seller-content.wildberries.ru/ns/analytics-api/content-analytics/api/v1/monetization/subscriptions/tariff
+[WQ][HDR] captured keys=['AuthorizeV3', 'Seller-Lk', 'content-type', 'root-version']
+[ERROR] 主循环异常（连续 1 次）: AttributeError: 'DailyWorker' object has no attribute '_sleep' | Traceback (most recent call last):   File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 59, in run     err_streak = 0   File "C:\Users\yuanbo\PycharmProjects\WelcomeScr
+[ERROR] 15s 后重试
+Exception in thread Thread-6 (_worker_main):
+Traceback (most recent call last):
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 59, in run
+    err_streak = 0
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 268, in _process_current
+    else:
+AttributeError: 'DailyWorker' object has no attribute '_sleep'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\yuanbo\AppData\Local\Programs\Python\Python314\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\yuanbo\AppData\Local\Programs\Python\Python314\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\app.py", line 63, in _worker_main
+    worker.run()
+    ~~~~~~~~~~^^
+  File "C:\Users\yuanbo\PycharmProjects\WelcomeScreen\wb_querywords\worker.py", line 68, in run
+    msg = f"{type(exc).__name__}: {str(exc)[:150]}"
+    ^^^^^^^^^^^
+AttributeError: 'DailyWorker' object has no attribute '_sleep'

@@ -41,6 +41,10 @@ class DailyWorker:
     def stop(self):
         self._stop_event.set()
 
+    def _sleep(self, seconds):
+        """可被 _stop_event 中断的休眠：/stop 置位后立即返回，不必等满 seconds。"""
+        self._stop_event.wait(timeout=seconds)
+
     # ------------------------------------------------------------ 主循环
     def run(self):
         state._set_snap(self.progress, status="starting", input_date=None,

@@ -18,8 +18,8 @@ OUTPUT_DIR = os.path.join(MODULE_DIR, "output")
 
 # ---------------------------------------------------------------- 店铺与登录
 # 用哪个店 profile 起浏览器（该店 profile 需已在生产机登录过 WB，DPAPI 才能解 cookie）。
-# A 机现有 4 店（store1-store4）；store1 是长期在跑的默认店。
-STORE_ID = "store1"
+# 用 store2（seller 250149024）的登录态跑。
+STORE_ID = "store2"
 
 # ---------------------------------------------------------------- 运行参数
 # A 分支: 只跑 searchViewItem 一路
