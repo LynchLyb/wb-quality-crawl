@@ -96,6 +96,7 @@ wb_querywords/
 - 其他非 2xx → 同一 (行,类型) 连续失败满 `MAX_RETRY_PER_ROW=3` 写空占位行并前进（避免单行死循环）。
 
 ### 4.6 Flask 宿主（端口 8082）
+- `AUTO_START=True`（config.py）：宿主进程启动即自动 `_ensure_worker()` 拉起 worker，无需手动 `/resume`；配合计划任务看门狗（宿主被重启→worker 自动回来）实现端到端自愈。`_ensure_worker` 有锁 + `is_alive` 守卫，不会双开。⚠️ `user_stopped` 内存态、不落盘，`/stop` 后若宿主被看门狗重启会被 AUTO_START 重新拉起，长期停用需 `Disable-ScheduledTask WB_QuerywordsHost`。
 - `POST /resume` / `POST /start` → 拉起 worker 线程（幂等，已在跑返回 409）。
 - `POST /stop` → 优雅停止：置 `_stop_event`；worker 在当前调用结束后落 state 并退出。
 - `GET /status` → `{worker_alive, input_date, max_input_date, processed_index, total_rows, current_recom_index, status, last_error, pending_local_dates{类型:[日期]}, uploaded[台账键], state}`。

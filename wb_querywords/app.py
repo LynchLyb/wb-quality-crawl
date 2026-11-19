@@ -129,6 +129,9 @@ def start():
 def main():
     print(f"[WQ-HOST] waitress 监听 http://{HOST}:{PORT}"
           f"（store={config.STORE_ID} recom_types={config.RECOM_TYPES}）", flush=True)
+    if config.AUTO_START:
+        ok, msg = _ensure_worker()
+        print(f"[WQ-HOST] AUTO_START 拉起 worker: ok={ok} {msg}", flush=True)
     serve(app, host=HOST, port=PORT, threads=4)
 
 

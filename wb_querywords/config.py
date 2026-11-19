@@ -29,6 +29,11 @@ RECOM_TYPES = ["searchViewItem"]
 # 纯 input 驱动：无固定时间窗口，靠每小时扫 OSS input 取最大日期文件推进
 INPUT_SCAN_INTERVAL = 3600     # 每隔 1 小时重新扫描 input 取最大日期（秒）
 
+# 宿主启动即自动拉起 worker（配合计划任务看门狗实现端到端自愈）；
+# 关掉则需手动 POST /resume 才起 worker。user_stopped 是内存态，宿主被看门狗重启后
+# AUTO_START 会重新拉起 worker，长期停用请 Disable-ScheduledTask WB_QuerywordsHost。
+AUTO_START = True
+
 # ---------------------------------------------------------------- 接口
 RECO_URL = ("https://seller-content.wildberries.ru/ns/analytics-api/"
             "content-analytics/api/v2/competitor-comparison/recommendations")
