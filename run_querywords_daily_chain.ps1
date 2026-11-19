@@ -15,7 +15,7 @@
     部署前提：
         - WB_FetchHost（8080 常驻宿主，AUTO_START + 巡检自愈）保持启用；
         - 不要启用 WB_QuerywordsHost（常驻宿主），否则会与 batch 抢同一 run.lock；
-        - 本脚本注册为每日计划任务 WB_QuerywordsDailyChain，BJT 10:00 触发（配额重置后）。
+        - 本脚本注册为每日计划任务 WB_QuerywordsDailyChain，BJT 15:00（下午 3 点）触发。
 
     A / B 机通用：脚本只调模块，两类型差异（RECOM_TYPES）在各分支的 config.py 内，
     本脚本无需区分。请按本机实际项目根修改 $ProjectRoot。
