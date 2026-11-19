@@ -110,7 +110,7 @@ def _http_post(url, timeout=10):
         return False
 
 NEW_START_HOUR = 0         # 新模块每天窗口开始小时（可调）
-NEW_HOURS = 24             # 新模块每天运行小时数（可调；24=全量跑新，旧模块仅在无待处理 nmID 任务时兜底）
+NEW_HOURS = 12             # 新模块每天运行小时数（可调；12=新 00:00-12:00，旧 tableListv6 12:00-24:00）
                            # 约束: NEW_START_HOUR + NEW_HOURS <= 24（窗口不跨天）
 STOP_WAIT_TIMEOUT = 180    # 等待模块完全停止的最长时间（秒）；旧模块优雅停止最坏
                            # ≈ 首捕 CAPTURE_TIMEOUT 120s + 限流 RATE_LIMIT_PAUSE 30s + 周期余量
