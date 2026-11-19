@@ -1,7 +1,7 @@
 # wb_querywords — 搜索词推荐词抓取方案（纯 input 驱动）
 
 > A 分支（nmid-fetch）实现 `recomType=searchViewItem` 单路；B 分支（nmid-fetch-two）实现 `recomType=searchOrders` 与 `searchAddToCart` 双路。
-> 本目录是**独立抓取器**，与 `nmid_fetch/`（按 nmID 抓商品详情）、根 `fetch_all.py`（全量商品翻页）互不重叠；生产不再同时开：`原来的停掉，单独跑这个`。
+> 本目录是**独立抓取器**，与 `nmid_fetch/`（按 nmID 抓商品详情）、根 `fetch_all.py`（全量商品翻页）互不重叠。因推荐接口**每日仅 100 次配额**且与 `fetch_all` **共用 store1 profile**，生产采用**每日串行链**：先跑本模块 batch 用完配额（几分钟），再跑 fetch_all（详见 §4.9），二者不同时抢浏览器。
 
 ---
 
@@ -23,7 +23,10 @@
 ## 2. 接口与响应字段
 
 响应结构（实测）：`{"error": false, "errorText": "", "data": [{nmID, title, mainPhoto, ...}, ...]}`
-——注意 `data` 直接是数组（不是 `data.recommendations`）；`error=true` 视为业务失败不解析。
+——注意 `data` 直接是数组（不是 `data.recommendations`）。**2xx 但 `error=true` 是业务错误，需按 `errorText` 分类**（见 §4.5）：
+- `errorText=content.analytics.limitExceeded`：**每日对比推荐配额已用尽**（页面提示"每日最多 100 个对比推荐，明天重置"）——这是**按账号的硬日限额**，当天再怎么退避都不会成功，只能等次日重置。worker 命中即**干净收尾退出、不丢词**（详见 §4.5、§4.9）。
+- 其它 `errorText`：该 (行,类型) 的持久业务错误，按单行重试上限处理。
+- `error=false` 且 `data=[]`：该词**确实无推荐**（真空结果），正常写占位行并前进。
 每条推荐取字段：
 ```
 { "nmID": 265843232, "title": "Куртка оверсайз", "mainPhoto": "https://basket-17.wbbasket.ru/..." }
@@ -44,8 +47,9 @@ wb_querywords/
   api_client.py     # 切店 → 捕获 analytics-api 头 → 归一化 → POST 循环（复用 _probe_reco3.py 骨架）
   csv_io.py         # 输入读取（search_request+search_volume，按量降序）/ ShardWriter 临时分片 / merge_shards 合并
   oss_uploader.py   # OSS input 列举+下载 / 合并文件上传（output/<类型>/<日期>.csv）/ 上传台账判重
-  worker.py         # 纯 input 驱动主循环 + 每小时重扫 + 切换统一上传 + 429 闭环退避
-  app.py            # Flask 宿主 127.0.0.1:8082  /health /status /stop /resume /start
+  worker.py         # 纯 input 驱动主循环 + 每小时重扫 + 切换统一上传 + 429 闭环退避 + limitExceeded 日配额收尾
+  app.py            # Flask 常驻宿主 127.0.0.1:8082  /health /status /stop /resume /start
+  batch.py          # 批处理入口（one_shot）：跑完当天 input 或命中日配额即退出，供每日计划任务链调用
   README.md         # 本方案
   input/            # 从 OSS 下载的 input 副本（gitignore）
   output/           # 按类型分子目录的临时分片 + 合并产物（gitignore，上传源+崩溃恢复）
@@ -88,12 +92,16 @@ wb_querywords/
 - 后续每行只需 `call_api(driver, RECO_URL, "POST", headers, body)`，无需重开浏览器。
 - client 启动失败 → 写断点、60s 退避重试。
 
-### 4.5 429 限流闭环退避
-每次 `query` 后按状态：
-- `2xx` → 成功；连续成功满 `CLEAN_STREAK=50` 把 interval 缩回 `CALL_INTERVAL=1.2`。
-- `429` → interval 翻倍至 `BACKOFF_CAP=300`。
+### 4.5 限流、退避与日配额处理
+`api_client.query` 返回 `(status, recs, raw, error_text)`，worker 每次调用后按下面分类：
+- `2xx` 且 `error=false` → **成功**（含 `data=[]` 真空，正常写占位行并前进）；连续成功满 `CLEAN_STREAK=50` 把 interval 缩回 `CALL_INTERVAL=1.2`。
+- `2xx` 且 `errorText` 含 `limitExceeded` → **每日配额用尽**：**不写占位、不前进**（当前词/类型留待次日重置后从断点补），存断点后**干净收尾退出进程**（`status=quota_exhausted`）。当天继续重试无意义（硬日限额），交由每日链次日再跑。
+- `2xx` 且其它 `errorText` → 该 (行,类型) 的持久业务错误，计入单行重试上限（见下）。
+- `429` → interval 翻倍至 `BACKOFF_CAP=300`（这是"手太快"的速率限流，退避后重试同一行）。
 - `401/403` → 连续 3 次视为登录态失效，写断点、`status=auth_failed`、300s 退避（需人工重登，不无限刷）。
-- 其他非 2xx → 同一 (行,类型) 连续失败满 `MAX_RETRY_PER_ROW=3` 写空占位行并前进（避免单行死循环）。
+- 其他非 2xx / 非配额业务错误 → 同一 (行,类型) 连续失败满 `MAX_RETRY_PER_ROW=3` 写空占位行并前进（避免单行死循环）。
+
+> 关键区分：**429 = 速率限流**（退避重试可解）；**limitExceeded = 每日配额**（当天不可解，只能次日续）。二者都**不丢词**，但 limitExceeded 会直接结束当天批次。
 
 ### 4.6 Flask 宿主（端口 8082）
 - `AUTO_START=True`（config.py）：宿主进程启动即自动 `_ensure_worker()` 拉起 worker，无需手动 `/resume`；配合计划任务看门狗（宿主被重启→worker 自动回来）实现端到端自愈。`_ensure_worker` 有锁 + `is_alive` 守卫，不会双开。⚠️ `user_stopped` 内存态、不落盘，`/stop` 后若宿主被看门狗重启会被 AUTO_START 重新拉起，长期停用需 `Disable-ScheduledTask WB_QuerywordsHost`。
@@ -117,11 +125,22 @@ wb_querywords/
 
 `worker.py` / `api_client.py` / `csv_io.py` / `state.py` / `app.py` 完全按 `RECOM_TYPES` 长度自适应，无分支硬编码。
 
+### 4.9 批处理模式与每日计划任务链（与 fetch_all 共存）
+因推荐接口是**每日 100 次硬配额**、且与 `fetch_all` **共用 store1 profile**（不能并行），生产采用**每日串行链**而非 querywords 常驻宿主：
+
+- **批处理入口** `python -m wb_querywords.batch`（`one_shot=True`）：从断点续跑当天 input，遇下列任一情况**即退出进程**——① 命中 `limitExceeded`（日配额用尽）；② 当天 input 全部行跑完；③ OSS 无可用 input。退出前存断点、释放单实例锁与 Chrome。
+- **每日计划任务链**（BJT 10:00 触发，配额重置后）串三步：
+  1. 优雅停 fetch_all（`POST /stop?store=store1`，等 `worker_alive=false`，释放 store1 profile）；
+  2. 跑 `wb_querywords.batch`（约 2~3 分钟用完 100 次配额或跑完当天，自动退出）；
+  3. 重新拉起 fetch_all（`POST /start?store=store1&resume=1`，继续几小时的大拉）。
+- 因此 **`WB_QuerywordsHost`（常驻宿主）在每日链模式下应禁用**，改由链调用 batch；`WB_FetchHost` 保持常驻（AUTO_START+巡检自愈），链只在其间插入几分钟 querywords。
+- batch 与宿主用**同一** `run.lock`，二者不会同时抢 store1；链里"先停 fetch_all 再跑 batch"是跨模块（fetch_all 与 querywords 锁文件不同）必须的人工串行。
+
 ## 5. 提交与部署节奏（本轮约定）
 
 1. **A 分支**：本方案 + 全套代码 + `RECOM_TYPES=["searchViewItem"]` + `.gitignore`。写完停下等你审 & 提交。
 2. 你审 & 提交 A → 我把 B 分支快进到最新基线，把同一套代码搬进 B 并只改 `RECOM_TYPES=["searchOrders","searchAddToCart"]`。
-3. 生产切换由你手动执行：`Disable-ScheduledTask WB_FetchHost / WB_NmidCoordinator` → `Enable/注册 WB_QuerywordsHost`（B 同理）。
+3. 生产运行（每日串行链，见 §4.9）：`WB_FetchHost` 保持常驻（AUTO_START+巡检）；**不启用 `WB_QuerywordsHost`**；注册每日 BJT 10:00 的链任务 `WB_QuerywordsDailyChain`：停 fetch_all worker → `python -m wb_querywords.batch` → 起 fetch_all worker（`.ps1` 由运维单独提供）。
 
 ## 6. 补充说明（避免误解）
 
