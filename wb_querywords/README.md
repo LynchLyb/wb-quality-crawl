@@ -129,7 +129,7 @@ wb_querywords/
 因推荐接口是**每日 100 次硬配额**、且与 `fetch_all` **共用 store1 profile**（不能并行），生产采用**每日串行链**而非 querywords 常驻宿主：
 
 - **批处理入口** `python -m wb_querywords.batch`（`one_shot=True`）：从断点续跑当天 input，遇下列任一情况**即退出进程**——① 命中 `limitExceeded`（日配额用尽）；② 当天 input 全部行跑完；③ OSS 无可用 input。退出前存断点、释放单实例锁与 Chrome。
-- **每日计划任务链**（BJT 10:00 触发，配额重置后）串三步：
+- **每日计划任务链**（BJT 15:00（下午 3 点）触发）串三步：
   1. 优雅停 fetch_all（`POST /stop?store=store1`，等 `worker_alive=false`，释放 store1 profile）；
   2. 跑 `wb_querywords.batch`（约 2~3 分钟用完 100 次配额或跑完当天，自动退出）；
   3. 重新拉起 fetch_all（`POST /start?store=store1&resume=1`，继续几小时的大拉）。
@@ -140,7 +140,7 @@ wb_querywords/
 
 1. **A 分支**：本方案 + 全套代码 + `RECOM_TYPES=["searchViewItem"]` + `.gitignore`。写完停下等你审 & 提交。
 2. 你审 & 提交 A → 我把 B 分支快进到最新基线，把同一套代码搬进 B 并只改 `RECOM_TYPES=["searchOrders","searchAddToCart"]`。
-3. 生产运行（每日串行链，见 §4.9）：`WB_FetchHost` 保持常驻（AUTO_START+巡检）；**不启用 `WB_QuerywordsHost`**；注册每日 BJT 10:00 的链任务 `WB_QuerywordsDailyChain`：停 fetch_all worker → `python -m wb_querywords.batch` → 起 fetch_all worker（`.ps1` 由运维单独提供）。
+3. 生产运行（每日串行链，见 §4.9）：`WB_FetchHost` 保持常驻（AUTO_START+巡检）；**不启用 `WB_QuerywordsHost`**；注册每日 BJT 15:00（下午 3 点）的链任务 `WB_QuerywordsDailyChain`：停 fetch_all worker → `python -m wb_querywords.batch` → 起 fetch_all worker（`.ps1` 由运维单独提供）。
 
 ## 6. 补充说明（避免误解）
 
