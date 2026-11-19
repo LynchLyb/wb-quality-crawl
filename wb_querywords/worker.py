@@ -50,6 +50,7 @@ class DailyWorker:
                         processed_index=0, error=None, last_error=None)
         bucket = None
         err_streak = 0
+        auth_rounds = 0            # 连续 auth_failed 轮数（成功或其它状态清零）
         while not self._stop_event.is_set():
             try:
                 if bucket is None:
@@ -72,6 +73,16 @@ class DailyWorker:
                 if self.one_shot and self._pass_done:
                     print("[BATCH] 当天 input 已全部处理完，退出")
                     break
+                # auth_failed（登录态失效/账号冻结）：不再无限退避，连续达阈值即存断点退出进程
+                if self.progress["snap"].get("status") == "auth_failed":
+                    auth_rounds += 1
+                    stop_at = 1 if self.one_shot else config.AUTH_FAIL_STOP_ROUNDS
+                    if auth_rounds >= stop_at:
+                        print(f"[AUTH] 连续 {auth_rounds} 轮 auth_failed（one_shot={self.one_shot} 阈值={stop_at}）："
+                              f"存断点退出进程，词不丢；恢复登录态后常驻 /resume、批处理待次日链再跑")
+                        break
+                else:
+                    auth_rounds = 0
             except Exception as exc:
                 err_streak += 1
                 backoff = min(600, 15 * err_streak)
@@ -285,11 +296,15 @@ class DailyWorker:
                     auth_fail += 1
                     print(f"[AUTH] HTTP {status}（连续 {auth_fail}）登录态可能失效")
                     if auth_fail >= 3:
-                        print("[AUTH] 连续 3 次，停止 client 等待退避重试")
                         state.save_state(cur, processed, recom_idx, snapshot())
                         state._set_snap(self.progress, status="auth_failed",
                                         last_error=f"HTTP {status} 连续 {auth_fail} 次")
-                        self._sleep(300)
+                        if self.one_shot:
+                            print("[AUTH] 连续 3 次且为批处理模式：存断点立即退出（登录态失效/账号冻结，"
+                                  "不空睡，交由主循环收口、次日链再试）")
+                        else:
+                            print("[AUTH] 连续 3 次，停止 client，300s 退避后由主循环判是否达停止轮数")
+                            self._sleep(300)
                         return
                 elif status == 429:
                     interval = min(interval * 2, config.BACKOFF_CAP)

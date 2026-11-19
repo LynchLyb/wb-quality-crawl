@@ -47,6 +47,9 @@ RATE_LIMIT_PAUSE = 30                  # 429 后基础暂停
 BACKOFF_CAP = 300                      # 429 连撞暂停上限
 CLEAN_STREAK = 50                      # 连续成功 N 次把 interval 缩回基线
 MAX_RETRY_PER_ROW = 3                  # 单行连续非 2xx 失败上限（超过跳过该行）
+# 连续 auth_failed（401/403×3，登录态失效/账号冻结）达此轮数则存断点退出进程，
+# 交回人工：常驻需 /resume 重登后再起，batch 则由次日计划任务链再试。one_shot 命中首轮即退。
+AUTH_FAIL_STOP_ROUNDS = 3
 
 # ---------------------------------------------------------------- 输出
 # 每行 = 一条推荐结果；searchText/recomType 为入参上下文，nmID/title/mainPhoto 来自响应 data[]
