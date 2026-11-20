@@ -145,6 +145,7 @@ wb_querywords/
   3. 逐个拉起各店 fetch_all（`POST /start?store=<id>&resume=1`，继续几小时的大拉）。
 - **为何每小时（限窗口）**：新 input 到达后≤ 1 小时（且落在 13:30–19:30 窗口内）自动开跑；意外重启后同理≤ 1 小时自动从断点续跑完（比“固定 15:00 + 单加开机触发”更省心）。上一轮 batch 还在跑时，预检因抢不到 `run.lock` 直接判 false 退出，不会重复起链、也不会误唤醒被本轮停下的 fetch_all。
 - 因此 **`WB_QuerywordsHost`（常驻宿主）在巡检链模式下应禁用**；`WB_FetchHost` 保持常驻。链里"先停各店 fetch_all 再跑 batch"必须覆盖**回退链涉及的所有店**（接力会先后开多店浏览器）。
+- **与新旧轮转协调器的互斥（独占期让路）**：B 机 `nmid_fetch/coordinator.py` 是**完成驱动、无时间窗**（今日 nmID 未跑完→跑新并压制旧；已完成/无数据→旧模块巡检跑剩余时间），每 60s 一拍——链 step-1 刚把 store2 的 fetch_all 停下，协调器下一拍就会 `/resume?store=all` 把它复活抢 `chrome_profile`（有 nmid 活时则会切 8081 用同一 profile）。为此链在 **step-1 之前**写哨兵 `nmid_data/querywords_chain.lock`（内容 = 本脚本 PowerShell PID），协调器主循环**每拍最前面** `_querywords_chain_running()` 检测到该 PID 存活就**整轮让路**（两分支都不进，不 /stop /resume /切换任何模块），链 step-3 之后删哨兵；即使没删成，进程退出→PID 判活即假→协调器下一拍自动放行（自愈，不会永久卡住协调器）。保证“batch 独占期 fetch_all 让路，跑完自动交回 fetch_all”。
 
 ## 5. 提交与部署节奏（本轮约定）
 
@@ -158,4 +159,4 @@ wb_querywords/
 - **列名识别**：`config.TEXT_COL_CANDIDATES` 优先精确 `search_request`，`VOL_COL_CANDIDATES` 优先精确 `search_volume`（靠候选顺序 + 列位置先后，避开 `avg_daily_search_volume`）。未匹配上表头时按位置回退（第 0 列词、第 1 列量）。实际列名不在候选里，往 `config.py` 相应元组追加即可。
 - **排序兜底**：上游一般已按 `search_volume` 降序；`read_pairs` 再稳定降序一次，相同量保持原顺序；量解析失败按 0 排末尾。
 - **上传时机**：**批处理（生产链默认）跑完即上传**（当天跑完/全店配额用尽即跨店合并上传）；常驻模式仍保留“延迟统一上传”（只有出现更大日期 input 时旧日期才统一上传）。若 input 长时间不更新且只跑常驻，最新那份会一直留本地待传。
-- **不改现有协调器 / nmid_fetch / fetch_all**：本模块独立，仅通过 Windows 计划任务停掉旧进程达到 exclusive 效果。
+- **协调器协同（已从“零改动”升级）**：本模块自身不改 `nmid_fetch` / `fetch_all` 的抓取逻辑，但**新旧轮转协调器 `coordinator.py` 已加入“识别搜索词链独占哨兵并让路”的守卫**（见 §4.9 互斥条）——因为 B 协调器无时间窗、全天每 60s 维持旧模块，纯靠计划任务停 fetch_all 保不住 profile。链仍靠“停旧进程 + 写让路哨兵”双手段达到 exclusive。

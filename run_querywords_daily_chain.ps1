@@ -23,6 +23,11 @@
     只有 OSS 出现更晚日期的新文件才会再跑；仅当天崩在中途（无 day_done 且是今日文件）才原地恢复，
     往日没跑完且今天无新文件则不补（配额宁可闲着）。
 
+    与新旧轮转协调器（nmid_fetch/coordinator.py，完成驱动、每 60s 一拍）的互斥：步骤 1 前写入
+    nmid_data/querywords_chain.lock（内容 = 本脚本 PowerShell PID），协调器检测到该 PID 存活会整轮
+    让路（不再 /resume 旧模块、也不切新模块来抢 profile）；步骤 3 后删哨兵，若脚本异常退出
+    没删也无妨——进程一死 PID 判活即假，协调器下一拍自动放行，fetch_all 交回正常维持。
+
     部署前提：
         - WB_FetchHost（8080 常驻宿主，AUTO_START + 巡检自愈）保持启用；
         - 不要启用 WB_QuerywordsHost（常驻宿主），否则会与 batch 抢同一 run.lock；
@@ -95,6 +100,18 @@ if ($checkExit -ne 0 -or $checkText -notmatch "WQ_CHECK_DUE=true") {
 }
 Log "[DUE] 预检有待办，进入串行链：停 fetch_all -> 跑 batch -> 起 fetch_all"
 
+# ---- 独占期哨兵：让协调器在“停旧→跑batch→起旧”整段让路（否则它会每 60s 把 batch 期间停下的 fetch_all 又 /resume 回来抢 profile）----
+# 必须在这里（step-1 停旧之前）就写：因为 step-1 最多等 180s 让旧退出，这段 batch 还未拿 run.lock，只能靠本哨兵。
+$CoordLock = Join-Path $ProjectRoot "nmid_data\querywords_chain.lock"
+try {
+    $coordDir = Split-Path $CoordLock
+    if (-not (Test-Path $coordDir)) { New-Item -ItemType Directory -Force -Path $coordDir | Out-Null }
+    "$PID" | Out-File -FilePath $CoordLock -Encoding ascii -NoNewline
+    Log "已写协调器让路哨兵 (PID=$PID) -> $CoordLock"
+} catch {
+    Log "[!] 写让路哨兵失败（协调器可能在本轮复活 fetch_all）：$($_.Exception.Message)"
+}
+
 # ---- 1. 优雅停回退链各店的 fetch_all worker，释放各自 profile ----
 $stopped = $true
 try {
@@ -153,6 +170,13 @@ try {
     }
 } catch {
     Log "[!] 拉起 fetch_all 失败（宿主可能没在跑，巡检会自愈）：$($_.Exception.Message)"
+}
+
+# ---- 清除独占期哨兵（协调器随即恢复对旧模块的维持；即使此处没删成，本进程退出后 PID 判活即失效，自愈）----
+try {
+    if (Test-Path $CoordLock) { Remove-Item -Force $CoordLock; Log "已清除协调器让路哨兵" }
+} catch {
+    Log "[!] 清除让路哨兵失败（将由 PID 判活兜底自愈）：$($_.Exception.Message)"
 }
 
 Log "===== 巡检链结束（batchExit=$batchExit）====="

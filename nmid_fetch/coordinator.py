@@ -13,6 +13,8 @@
 
 守护:
     - 切换失败重试 3 次；停止超时则放弃本次切换（避免 profile 冲突）
+    - wb_querywords 串行链独占期（哨兵 querywords_chain.lock 里的 PowerShell PID 存活）整轮让路，
+      不 /resume 旧模块也不切新模块，保住 batch 的 Chrome profile（链结束删哨兵后自动恢复维持）
     - 停止等待超时 180s（覆盖旧模块首捕 120s + 限流暂停 30s 的最坏优雅停止耗时）
     - 新模块该跑时每分钟补发旧模块 /stop，防旧宿主 AUTO_START/崩溃重启复活 worker
     - 主循环 try/except 包裹，单次异常不致进程猝死
@@ -39,6 +41,15 @@ HEARTBEAT_FILE = os.path.join(
 SWITCH_HISTORY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "nmid_data", "switch_history.log")
+
+# 仓库根（供定位 wb_querywords 串行链哨兵）
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 搜索词串行链（run_querywords_daily_chain.ps1）独占期哨兵：链在“停 fetch_all → 跑 batch →
+# 起回 fetch_all”整段写入本文件（内容 = 链的 PowerShell PID）。协调器检测到该 PID 存活即整轮
+# 让路，绝不碰 8080/8081，避免在 batch 独占期把刚被链停下的旧模块 /resume 回来抢 profile。
+# 链正常收尾删哨兵；异常/重启没删也无妨——进程一死 PID 判活即假，下一拍自动放行（自愈）。
+QUERYWORDS_CHAIN_LOCK = os.path.join(_REPO_ROOT, "nmid_data", "querywords_chain.lock")
 
 # 日志落盘：协调器同样以 pythonw 无控制台拉起、print 会进黑洞，统一追加到 nmid_data/coordinator.log。
 # 启动时把上一份降级为 .old（只保留一代）；_log 自带每行时间戳。
@@ -145,6 +156,62 @@ def _new_work_pending_today():
     return not data.get("today_done")
 
 
+def _pid_alive(pid):
+    """判断给定 PID 的进程是否存活（内置一份，不 import fetch_all 以免其模块级副作用）。
+
+    Windows 上用 OpenProcess/GetExitCodeProcess，切勿用 os.kill(pid, 0)——
+    后者在 Windows 上会走 TerminateProcess 分支，可能误杀目标进程。
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # 打开失败：权限不足说明进程存在（保守判活），其余（如无效参数）判死
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True  # 句柄有效但查询失败，保守判活
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _querywords_chain_running():
+    """wb_querywords 串行链是否处于独占期：哨兵文件里的 PowerShell PID 仍存活即视为在跑。
+
+    链在“停 fetch_all → 跑 batch → 起回 fetch_all”整段持有哨兵（含 step-1 最多 180s 的
+    等旧退出窗口，此时 batch 还未拿 run.lock，故不能靠 run.lock）；此间协调器完全让路。
+    读不到/无此文件/PID 已死 → 未运行（自愈）。
+    """
+    if not os.path.exists(QUERYWORDS_CHAIN_LOCK):
+        return False
+    try:
+        with open(QUERYWORDS_CHAIN_LOCK, encoding="utf-8") as f:
+            pid = int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return False
+    return _pid_alive(pid)
+
+
 def switch_to_new():
     """停旧 → 起新；任一步失败返回 False（停止超时不强行 resume）。"""
     _log("[协调器] 停止旧模块 → 启动新模块")
@@ -225,6 +292,15 @@ def main():
     while True:
         try:
             _write_heartbeat()
+
+            # 搜索词串行链独占期：整轮让路，绝不碰 8080/8081（保住 batch 的 Chrome profile）。
+            # 本协调器是完成驱动、无时间窗，链的 13:30–19:30 窗口必然落在其覆盖范围内，
+            # 故两个分支（跑新压制旧 / 交旧巡检）都必须被让路守卫拦住。
+            # 链结束删哨兵后，下一拍回归正常轮转：旧模块该维持时会自动 /resume 拉起。
+            if _querywords_chain_running():
+                _log("[协调器] 检测到 wb_querywords 链独占（querywords_chain.lock 存活），本轮让路，60s 后重判")
+                time.sleep(60)
+                continue
 
             if _new_work_pending_today():
                 # 今日 nmID 轮次未完成：新模块跑（断点续传），持续压制旧模块防抢 profile
