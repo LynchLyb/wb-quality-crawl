@@ -81,6 +81,8 @@ class DailyWorker:
                     if self.one_shot and cur:
                         print(f"[QUOTA] 全部店铺配额用尽，跑完即上传当前日期 {cur}")
                         self._finalize_date(bucket, cur)
+                    if cur:
+                        state.mark_day_done(cur, "quota")
                     print("[QUOTA] 命中每日对比推荐配额上限，本轮收尾退出（未跑完的词留待明日重置后补）")
                     break
                 if self.one_shot and self._pass_done:
@@ -88,6 +90,7 @@ class DailyWorker:
                     if cur:
                         print(f"[BATCH] 当天 input 全部处理完，跑完即上传当前日期 {cur}")
                         self._finalize_date(bucket, cur)
+                        state.mark_day_done(cur, "done")
                     print("[BATCH] 当天 input 已全部处理完，退出")
                     break
                 # auth_failed（登录态失效/账号冻结）：不再无限退避，连续达阈值即存断点退出进程
@@ -462,3 +465,37 @@ class DailyWorker:
         state._set_snap(self.progress, status="stopped", reason=reason,
                         processed_index=st.get("processed_index"))
         print(f"[FINISH] {reason}")
+
+
+def check_due():
+    """每小时巡检的轻量预检：不起浏览器、不碰 fetch_all，只判断“本轮要不要进链”。
+
+    返回 (due, reason)。due=True 才值得去停 fetch_all、跑 batch。策略：**每天只跑最新文件，
+    跑过的文件（写过 day_done，无论 done 还是 quota）一律丢弃不再续跑**。判据：
+        - 已有实例持锁（上一轮 batch 还在跑）→ 不进链（避免重复起链、误唤醒 fetch_all）
+        - OSS 最新 input 日期 != 上次跑的日期 → 来了更新的文件，进链（切最新、从第 0 词跑）
+        - 最新==上次且该文件已有 day_done → 跳过（这份跑过了，丢弃，等更新文件）
+        - 最新==上次、无 day_done 且文件日期==今天 → 当天崩在中途，进链从断点原地恢复
+        - 最新==上次、无 day_done 但文件日期不是今天（往日没跑完且今天无新文件）→ 跳过，不补跑
+    """
+    if not state.acquire_lock():
+        return False, "已有 wb_querywords 实例在运行，本轮跳过"
+    state.release_lock()
+    try:
+        bucket = oss_uploader.get_bucket()
+        latest = oss_uploader.max_input_date(bucket)
+    except Exception as exc:
+        return False, f"OSS 读取失败，本轮跳过: {type(exc).__name__}: {str(exc)[:120]}"
+    last = state.load_state().get("input_date")
+    dd = state.load_day_done()
+    if latest and latest != last:
+        return True, f"发现更新 input {latest}（上次 {last}），切新文件从第 0 词跑"
+    if not last:
+        return False, "OSS 无可用 input 日期，跳过"
+    if dd.get("input_date") == last:
+        return False, f"input {last} 已跑过（day_done={dd.get('status')}），丢弃不续，等更新文件"
+    # 最新==上次且无 day_done：仅当这份就是今日日期的文件才当作“当天崩在中途”可原地恢复；
+    # 否则是往日文件且今天没出新文件 → 按策略不补（配额宁可闲着）。
+    if last == config.today_bjt_str():
+        return True, f"续跑当天未完成 input {last}（无 day_done，当日中断恢复）"
+    return False, f"input {last} 非今日且无更新文件，按策略不补跑（配额闲置）"

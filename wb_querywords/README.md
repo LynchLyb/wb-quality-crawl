@@ -1,7 +1,7 @@
 # wb_querywords — 搜索词推荐词抓取方案（纯 input 驱动）
 
 > A 分支（nmid-fetch）实现 `recomType=searchViewItem` 单路；B 分支（nmid-fetch-two）实现 `recomType=searchOrders` 与 `searchAddToCart` 双路。
-> 本目录是**独立抓取器**，与 `nmid_fetch/`（按 nmID 抓商品详情）、根 `fetch_all.py`（全量商品翻页）互不重叠。因推荐接口**每店每日仅 100 次配额**（按店计，多店接力可翻倍）且与 `fetch_all` **共用同一批店铺 profile**，生产采用**每日串行链**：先跑本模块 batch 用完各店配额（几分钟），再跑 fetch_all（详见 §4.9），二者不同时抢浏览器。
+> 本目录是**独立抓取器**，与 `nmid_fetch/`（按 nmID 抓商品详情）、根 `fetch_all.py`（全量商品翻页）互不重叠。因推荐接口**每店每日仅 100 次配额**（按店计，多店接力可翻倍）且与 `fetch_all` **共用同一批店铺 profile**（同目录不能双开），生产采用**每小时巡检串行链**：先跑 `--check-due` 预检，**只有有新 input 或有未完成进度才进链**跑本模块 batch 用完各店配额，再交回 fetch_all（详见 §4.9），二者不同时抢浏览器；无待办的整点秒退、完全不碰 fetch_all。
 
 ---
 
@@ -47,9 +47,9 @@ wb_querywords/
   api_client.py     # 切店 → 捕获 analytics-api 头 → 归一化 → POST 循环（复用 _probe_reco3.py 骨架）
   csv_io.py         # 输入读取（search_request+search_volume，按量降序）/ ShardWriter 按店临时分片 / merge_shards 跨店合并
   oss_uploader.py   # OSS input 列举+下载 / 合并文件上传（output/<类型>/<日期>.csv）/ 上传台账判重
-  worker.py         # 纯 input 驱动主循环 + 多店接力切店 + 每小时重扫 + 429 闭环退避 + limitExceeded 接力/收尾 + 跑完即上传
+  worker.py         # 纯 input 驱动主循环 + 多店接力切店 + 每小时重扫 + 429 闭环退避 + limitExceeded 接力/收尾 + 跑完即上传 + day_done 台账；check_due() 供预检
   app.py            # Flask 常驻宿主 127.0.0.1:8082  /health /status /stop /resume /start
-  batch.py          # 批处理入口（one_shot）：跑完当天 input 或命中日配额即退出，供每日计划任务链调用
+  batch.py          # 批处理入口（one_shot）：跑完当天 input 或命中日配额即退出，供每小时巡检链调用；`--check-due` 做轻量预检（不起浏览器/不碰 fetch_all）
   README.md         # 本方案
   input/            # 从 OSS 下载的 input 副本（gitignore）
   output/           # 类型 > 店 > 分片三层目录 + 合并产物（gitignore，上传源+崩溃恢复）
@@ -130,22 +130,27 @@ wb_querywords/
 
 `worker.py` / `api_client.py` / `csv_io.py` / `state.py` / `app.py` 完全按 `RECOM_TYPES` 长度自适应，无分支硬编码。
 
-### 4.9 批处理模式与每日计划任务链（与 fetch_all 共存，多店接力）
-因推荐接口是**每店每日 100 次硬配额**（按店计）、且 `wb_querywords` 与 `fetch_all` **共用同一批店铺 profile**（不能并行），生产采用**每日串行链**而非 querywords 常驻宿主：
+### 4.9 批处理模式与每小时巡检链（与 fetch_all 共存，多店接力）
+因推荐接口是**每店每日 100 次硬配额**（按店计）、且 `wb_querywords` 与 `fetch_all` **共用同一批店铺 profile**（同目录不能双开、不能并行），生产不用 querywords 常驻宿主，改用**高频触发 + 轻量预检的串行链**：
 
 - **多店接力**（`config.STORE_IDS`，如 `["store1","store2"]`）：链首店跑到 `limitExceeded` 后 worker **自动起下一个店、从同一个词继续**（共享游标，词不丢不重），直至当天跑完或全部店配额用尽。接力下当日约能跑 ~2×100 词。
-- **批处理入口** `python -m wb_querywords.batch`（`one_shot=True`）：从断点续跑当天 input，遇下列任一情况**即退出进程**——① **全部店**配额都用尽；② 当天 input 全部行跑完；③ OSS 无可用 input。退出前存断点、**跨店合并上传当前日期**（跑完即上传）、释放锁与 Chrome。
-- **每日计划任务链**（BJT 15:00（下午 3 点）触发）串三步（逐店操作，需与 `STORE_IDS` 对齐）：
+- **预检 `--check-due`（步骤 0）**：`python -m wb_querywords.batch --check-due` 只读 OSS 最新日期 + 本地 `state.json`/`day_done.json`，打印 `WQ_CHECK_DUE=true|false`，**不起浏览器、不停 fetch_all**。判“有待办”= ①OSS 最新日期≠上次跑的日期（**来了更新的文件**）**或** ②最新==上次、无 day_done 且文件日期==今天（当天崩在中途、原地恢复）。其余一律 SKIP。false 则脚本直接退出，**该整点不打扰 fetch_all**。
+- **day_done 台账（幂等关键，“跑过即丢弃”）**：跑完写 `status=done`、全店配额用尽写 `status=quota`——两者都表示**这份跑过了**；此后**只有 OSS 出现更晚日期的新文件才会再跑**，绝不跨天续啃旧文件尾巴（没出新文件时即使昨日那份没跑完也不补，配额宁可闲着）。顺带避免“配额用尽后每个整点白起一次 Chrome 去撞 limitExceeded”。
+- **巡检窗口**（`$WinStart`–`$WinEnd`，默认 **13:30–19:30**，下午一点半到晚上七点半）：只在窗口内每小时跑一轮，窗口外脚本开头直接 `exit 0`（连预检都不做、不 spawn python）。ps1 里的窗口常量与计划任务的 `/ST /ET` **双保险**。
+- **巡检链**（**窗口内每小时**触发，`schtasks /SC HOURLY /MO 1 /ST 13:30 /ET 19:30`；取代旧的每日 15:00）串几步（逐店操作，需与 `STORE_IDS` 对齐）：
+  -1. 窗口判定：不在 `[$WinStart, $WinEnd]` → `exit 0`，不碰 fetch_all；
+  0. 跑 `--check-due`：无待办 → `exit 0`，不碰 fetch_all；
   1. 逐个优雅停各店 fetch_all（`POST /stop?store=<id>`，等**所有店** `worker_alive=false`，释放各自 profile）；
-  2. 跑 `wb_querywords.batch`（多店接力，每店几分钟用完配额，自动退出并上传）；
+  2. 跑 `wb_querywords.batch`（多店接力，每店几分钟用完配额，自动退出、跨店合并上传、写 day_done）；
   3. 逐个拉起各店 fetch_all（`POST /start?store=<id>&resume=1`，继续几小时的大拉）。
-- 因此 **`WB_QuerywordsHost`（常驻宿主）在每日链模式下应禁用**；`WB_FetchHost` 保持常驻。链里"先停各店 fetch_all 再跑 batch"必须覆盖**回退链涉及的所有店**（接力会先后开多店浏览器）。
+- **为何每小时（限窗口）**：新 input 到达后≤ 1 小时（且落在 13:30–19:30 窗口内）自动开跑；意外重启后同理≤ 1 小时自动从断点续跑完（比“固定 15:00 + 单加开机触发”更省心）。上一轮 batch 还在跑时，预检因抢不到 `run.lock` 直接判 false 退出，不会重复起链、也不会误唤醒被本轮停下的 fetch_all。
+- 因此 **`WB_QuerywordsHost`（常驻宿主）在巡检链模式下应禁用**；`WB_FetchHost` 保持常驻。链里"先停各店 fetch_all 再跑 batch"必须覆盖**回退链涉及的所有店**（接力会先后开多店浏览器）。
 
 ## 5. 提交与部署节奏（本轮约定）
 
 1. **A 分支**：本方案 + 全套代码 + `RECOM_TYPES=["searchViewItem"]` + `.gitignore`。写完停下等你审 & 提交。
 2. 你审 & 提交 A → 我把 B 分支快进到最新基线，把同一套代码搬进 B 并只改 `RECOM_TYPES=["searchOrders","searchAddToCart"]`。
-3. 生产运行（每日串行链，见 §4.9）：`WB_FetchHost` 保持常驻（AUTO_START+巡检）；**不启用 `WB_QuerywordsHost`**；注册每日 BJT 15:00（下午 3 点）的链任务 `WB_QuerywordsDailyChain`：停 fetch_all worker → `python -m wb_querywords.batch` → 起 fetch_all worker（`.ps1` 由运维单独提供）。
+3. 生产运行（每小时巡检链，见 §4.9）：`WB_FetchHost` 保持常驻（AUTO_START+巡检）；**不启用 `WB_QuerywordsHost`**；注册**仅在巡检窗口 13:30–19:30 内每小时**（`schtasks /SC HOURLY /MO 1 /ST 13:30 /ET 19:30`，取代旧的每日 15:00）的链任务 `WB_QuerywordsDailyChain`：窗口判定 → `--check-due` 预检 →（有待办才）停 fetch_all worker → `python -m wb_querywords.batch` → 起 fetch_all worker（`.ps1` 由运维单独提供）。
 
 ## 6. 补充说明（避免误解）
 
