@@ -16,10 +16,13 @@ MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(MODULE_DIR, "input")
 OUTPUT_DIR = os.path.join(MODULE_DIR, "output")
 
-# ---------------------------------------------------------------- 店铺与登录
-# 用哪个店 profile 起浏览器（该店 profile 需已在生产机登录过 WB，DPAPI 才能解 cookie）。
-# 用 store2（seller 250149024）的登录态跑。
-STORE_ID = "store2"
+# ---------------------------------------------------------------- 店铺与登录（多店接力）
+# 对比推荐配额**按店计**（实测每店每日各约 100 次），故设有序回退链：链首店跑满或
+# 命中 limitExceeded 后，worker 自动起链上下一个店、从**同一个词**继续（接力共享游标，词不丢不重）。
+# 用哪个店 profile 起浏览器（该店 profile 需已在生产机登录过 WB，DPAPI 才能解 cookie）；
+# 具体卖家 ID 见生产机本地 config.json（勿写入代码/提交），两店代号绑定不可改。
+STORE_IDS = ["store1", "store2"]   # 有序回退链：配额用尽依次切下一店
+STORE_ID = STORE_IDS[0]            # 兼容旧引用（api_client 默认店）
 
 # ---------------------------------------------------------------- 运行参数
 # A 分支: 只跑 searchViewItem 一路
@@ -106,8 +109,13 @@ def local_input_path(date_str):
 
 
 def type_output_dir(recom_type):
-    """某 recomType 的本地输出目录（临时分片 + 合并产物按类型分目录，A/B 各自隔离）。"""
+    """某 recomType 的本地输出根目录：合并产物 <date>.csv 落此，各店分片落其下的 <store>/ 子目录。"""
     return os.path.join(OUTPUT_DIR, recom_type)
+
+
+def store_output_dir(recom_type, store):
+    """某 recomType 下某店的本地工作区目录：output/<recomType>/<store>/（分片按店隔离）。"""
+    return os.path.join(type_output_dir(recom_type), store)
 
 
 def shard_filename(recom_type, shard_index, date_str):
@@ -115,9 +123,9 @@ def shard_filename(recom_type, shard_index, date_str):
     return f"{date_str}_{recom_type}_shard_{shard_index:03d}.csv"
 
 
-def shard_path(recom_type, shard_index, date_str):
-    """本地临时分片绝对路径（在类型子目录下）。"""
-    return os.path.join(type_output_dir(recom_type), shard_filename(recom_type, shard_index, date_str))
+def shard_path(recom_type, store, shard_index, date_str):
+    """本地临时分片绝对路径：output/<recomType>/<store>/<file>（按店分目录）。"""
+    return os.path.join(store_output_dir(recom_type, store), shard_filename(recom_type, shard_index, date_str))
 
 
 def merged_filename(date_str):
@@ -126,10 +134,10 @@ def merged_filename(date_str):
 
 
 def merged_path(recom_type, date_str):
-    """合并后本地文件绝对路径：output/<recomType>/<date>.csv。"""
+    """合并后本地文件绝对路径：output/<recomType>/<date>.csv（跨店分片合成一份，不分店）。"""
     return os.path.join(type_output_dir(recom_type), merged_filename(date_str))
 
 
 def oss_output_key(recom_type, date_str):
-    """OSS 上传 key：wb_querywords/output/<recomType>/<date>.csv。"""
+    """OSS 上传 key：wb_querywords/output/<recomType>/<date>.csv（**不含店维度**，两店合并成一份，布局与单店时一致）。"""
     return f"{OSS_OUTPUT_PREFIX}{recom_type}/{merged_filename(date_str)}"
