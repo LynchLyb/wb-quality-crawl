@@ -8,9 +8,11 @@
        - cur 为空 → 设为 max_date、下载 input、归零断点。
        - cur < max_date（扫到更新）→ 统一上传 cur → 切 max_date。
     3. _process_current：逐行处理 cur（按搜索量降序），每词对每个 recomType 各调一次，
-       结果即时 append 到 output/<recomType>/ 下临时分片（每 SHARD_SIZE 次调用一片）。
-       每 INPUT_SCAN_INTERVAL 秒重扫：出现更新 → 统一上传 cur → break 回主循环切新日期
-       （cur 剩余未跑词丢弃）。cur 跑完 → 不上传，空转等被更新 input 取代。
+       结果即时 append 到 output/<recomType>/<store>/ 下临时分片（每 SHARD_SIZE 次调用一片）。
+       **多店接力**：当前店命中 limitExceeded 则自动起回退链上下一个店、从同一个词继续（词不丢不重）；
+       各店分片写各自 <store>/ 子目录，最终跨店合并成一份。
+       每 INPUT_SCAN_INTERVAL 秒重扫：出现更新 → 统一上传 cur → break 回主循环切新日期。
+       one_shot 下当天跑完 / 全部店配额用尽 → 跑完即上传当前日期后退出。
 
 容错:
     - 429：interval 翻倍至 BACKOFF_CAP，连续成功 CLEAN_STREAK 缩回基线。
@@ -31,6 +33,8 @@ from wb_querywords.api_client import RecoClient
 
 class DailyWorker:
     def __init__(self, store_id=None, resume=False, progress=None, one_shot=False):
+        self.store_ids = list(config.STORE_IDS)   # 有序回退链：配额用尽依次切下一店
+        self.store_index = 0                        # 当前店下标（_process_current 从 state 恢复）
         self.store_id = store_id or config.STORE_ID
         self.resume = resume
         self.one_shot = one_shot          # True：跑完当天 input 或命中日配额即退出（供计划任务链批处理调用）
@@ -44,12 +48,17 @@ class DailyWorker:
     def stop(self):
         self._stop_event.set()
 
+    def _sleep(self, seconds):
+        """可被 _stop_event 中断的休眠：/stop 置位后立即返回，不必等满 seconds。"""
+        self._stop_event.wait(timeout=seconds)
+
     # ------------------------------------------------------------ 主循环
     def run(self):
         state._set_snap(self.progress, status="starting", input_date=None,
                         processed_index=0, error=None, last_error=None)
         bucket = None
         err_streak = 0
+        auth_rounds = 0            # 连续 auth_failed 轮数（成功或其它状态清零）
         while not self._stop_event.is_set():
             try:
                 if bucket is None:
@@ -66,12 +75,34 @@ class DailyWorker:
                 if st_now == "error":
                     continue
                 self._process_current(bucket)
+                cur = state.load_state().get("input_date")
                 if self._quota_exhausted:
+                    # 回退链所有店配额都用尽：跑完即上传当前日期（未跑完词留待明日重置后补）
+                    if self.one_shot and cur:
+                        print(f"[QUOTA] 全部店铺配额用尽，跑完即上传当前日期 {cur}")
+                        self._finalize_date(bucket, cur)
+                    if cur:
+                        state.mark_day_done(cur, "quota")
                     print("[QUOTA] 命中每日对比推荐配额上限，本轮收尾退出（未跑完的词留待明日重置后补）")
                     break
                 if self.one_shot and self._pass_done:
+                    # 当天 input 全部处理完：跑完即上传
+                    if cur:
+                        print(f"[BATCH] 当天 input 全部处理完，跑完即上传当前日期 {cur}")
+                        self._finalize_date(bucket, cur)
+                        state.mark_day_done(cur, "done")
                     print("[BATCH] 当天 input 已全部处理完，退出")
                     break
+                # auth_failed（登录态失效/账号冻结）：不再无限退避，连续达阈值即存断点退出进程
+                if self.progress["snap"].get("status") == "auth_failed":
+                    auth_rounds += 1
+                    stop_at = 1 if self.one_shot else config.AUTH_FAIL_STOP_ROUNDS
+                    if auth_rounds >= stop_at:
+                        print(f"[AUTH] 连续 {auth_rounds} 轮 auth_failed（one_shot={self.one_shot} 阈值={stop_at}）："
+                              f"存断点退出进程，词不丢；恢复登录态后常驻 /resume、批处理待次日链再跑")
+                        break
+                else:
+                    auth_rounds = 0
             except Exception as exc:
                 err_streak += 1
                 backoff = min(600, 15 * err_streak)
@@ -129,11 +160,14 @@ class DailyWorker:
         return p
 
     def _backfill(self, bucket, cur):
-        """把本地 output 里不属于 cur 的分片按 (类型,日期) 统一上传（旧日期收尾/崩溃补传）。"""
+        """把本地 output 里不属于 cur 的分片按 (类型,日期) 统一上传（旧日期收尾/崩溃补传）。
+
+        多店接力下分片目录为 output/<recomType>/<store>/，故对 (类型,日期) 去重后跨店合并上传。
+        """
         seen = set()
-        for sp in glob.glob(os.path.join(config.OUTPUT_DIR, "*", "*_shard_*.csv")):
+        for sp in glob.glob(os.path.join(config.OUTPUT_DIR, "*", "*", "*_shard_*.csv")):
             date = os.path.basename(sp)[:8]
-            recom = os.path.basename(os.path.dirname(sp))
+            recom = os.path.basename(os.path.dirname(os.path.dirname(sp)))
             if date == cur or (recom, date) in seen:
                 continue
             seen.add((recom, date))
@@ -162,6 +196,15 @@ class DailyWorker:
             except OSError:
                 pass
 
+    def _start_client(self, store_index):
+        """按回退链下标起一个 RecoClient（独立 profile 重开浏览器 + 下拉框切该店）。异常抛给调用方。"""
+        sid = self.store_ids[store_index]
+        self.store_id = sid
+        client = RecoClient(store_id=sid)
+        client.start()
+        print(f"[WQ][STORE] 起店 store={sid}（store_index={store_index}/{len(self.store_ids) - 1}）", flush=True)
+        return client
+
     # ------------------------------------------------------------ 处理当前日期
     def _process_current(self, bucket):
         st = state.load_state()
@@ -179,32 +222,44 @@ class DailyWorker:
 
         processed = int(st.get("processed_index", 0))
         recom_idx = int(st.get("current_recom_index", 0))
+        store_index = int(st.get("store_index", 0) or 0)
+        if store_index >= len(self.store_ids):
+            store_index = 0
+        self.store_index = store_index
+        self.store_id = self.store_ids[store_index]
         shard_state = st.get("shards", {}) or {}
         state._set_snap(self.progress, status="running", input_date=cur,
-                        input_rows=total, processed_index=processed)
+                        input_rows=total, processed_index=processed,
+                        store_index=store_index, store_id=self.store_id)
         print(f"[ROUND] input={cur} 行数={total} 起点 processed_index={processed} "
+              f"店={self.store_id}(index={store_index}) 回退链={self.store_ids} "
               f"recom_types={config.RECOM_TYPES}")
 
-        writers = {r: csv_io.ShardWriter(r, cur) for r in config.RECOM_TYPES}
-        self._writers = writers
-        calls = {r: int(shard_state.get(r, {}).get("calls_in_shard", 0)) for r in config.RECOM_TYPES}
-        shard_index = {r: int(shard_state.get(r, {}).get("shard_index", 1)) for r in config.RECOM_TYPES}
-        for r in config.RECOM_TYPES:
-            writers[r].ensure_open(shard_index[r])
+        def open_store_writers(store, base_shards):
+            """为某店开一套分片写入器（先关上一店）；base_shards 提供续跑进度，切新店传 {} 从头。"""
+            self._close_writers()
+            w = {r: csv_io.ShardWriter(r, store, cur) for r in config.RECOM_TYPES}
+            c = {r: int(base_shards.get(r, {}).get("calls_in_shard", 0)) for r in config.RECOM_TYPES}
+            si = {r: int(base_shards.get(r, {}).get("shard_index", 1)) for r in config.RECOM_TYPES}
+            for r in config.RECOM_TYPES:
+                w[r].ensure_open(si[r])
+            self._writers = w
+            return w, c, si
+
+        writers, calls, shard_index = open_store_writers(self.store_id, shard_state)
 
         def snapshot():
             return {r: {"shard_index": shard_index[r], "calls_in_shard": calls[r]}
                     for r in config.RECOM_TYPES}
 
-        client = RecoClient(store_id=self.store_id)
         try:
-            client.start()
+            client = self._start_client(store_index)
         except Exception as exc:
             self._close_writers()
             msg = f"{type(exc).__name__}: {str(exc)[:150]}"
-            print(f"[CLIENT][X] 启动失败: {msg}")
+            print(f"[CLIENT][X] 起店 {self.store_id} 失败: {msg}")
             state._set_snap(self.progress, status="client_error", last_error=msg)
-            state.save_state(cur, processed, recom_idx, snapshot())
+            state.save_state(cur, processed, recom_idx, snapshot(), store_index)
             self._sleep(60)
             return
 
@@ -238,9 +293,39 @@ class DailyWorker:
                 if 200 <= status < 300:
                     auth_fail = 0
                     if error_text and "limitExceeded" in error_text:
-                        # 每日对比推荐配额已用尽：不写占位、不前进（词留待明日重置后补），存断点后收尾退出
-                        print(f"[QUOTA] limitExceeded 命中 '{search_text[:40]}'（{recom}）：当天配额用尽，存断点退出")
-                        state.save_state(cur, processed, recom_idx, snapshot())
+                        # 该店每日对比推荐配额用尽：不写占位、不前进（当前词留给下一店或明日）
+                        if store_index < len(self.store_ids) - 1:
+                            nxt = self.store_ids[store_index + 1]
+                            print(f"[QUOTA] 店 {self.store_id} 配额用尽 '{search_text[:40]}'（{recom}）："
+                                  f"切下一店 {nxt} 从词 {processed} 续跑（词不丢不重）")
+                            try:
+                                client.stop()
+                            except Exception:
+                                pass
+                            store_index += 1
+                            self.store_index = store_index
+                            try:
+                                client = self._start_client(store_index)
+                            except Exception as exc:
+                                msg = f"{type(exc).__name__}: {str(exc)[:150]}"
+                                print(f"[CLIENT][X] 切店 {self.store_id} 起浏览器失败: {msg}，存断点退避重试")
+                                state.save_state(cur, processed, recom_idx, snapshot(), store_index)
+                                state._set_snap(self.progress, status="client_error", last_error=msg)
+                                self._sleep(60)
+                                return
+                            # 新店重查同一个词：分片从头，重置该店速率/重试计数
+                            writers, calls, shard_index = open_store_writers(self.store_id, {})
+                            interval = config.CALL_INTERVAL
+                            clean_streak = 0
+                            auth_fail = 0
+                            row_retry = {}
+                            state.save_state(cur, processed, recom_idx, snapshot(), store_index)
+                            state._set_snap(self.progress, status="running", store_index=store_index,
+                                            store_id=self.store_id, processed_index=processed)
+                            continue
+                        # 已是回退链最后一个店：全部店配额用尽，存断点后收尾退出（未跑完词留待明日）
+                        print(f"[QUOTA] limitExceeded 命中 '{search_text[:40]}'（{recom}）：全部店铺当日配额用尽，存断点退出")
+                        state.save_state(cur, processed, recom_idx, snapshot(), store_index)
                         state._set_snap(self.progress, status="quota_exhausted",
                                         last_error="content.analytics.limitExceeded",
                                         processed_index=processed, total_rows=total)
@@ -261,7 +346,7 @@ class DailyWorker:
                             if recom_idx >= len(config.RECOM_TYPES):
                                 processed += 1
                                 recom_idx = 0
-                            state.save_state(cur, processed, recom_idx, snapshot())
+                            state.save_state(cur, processed, recom_idx, snapshot(), store_index)
                         else:
                             print(f"[WARN] ({processed},{recom}) 业务错误 errorText={error_text[:60]} "
                                   f"retry={n}/{config.MAX_RETRY_PER_ROW}")
@@ -277,7 +362,7 @@ class DailyWorker:
                         if recom_idx >= len(config.RECOM_TYPES):
                             processed += 1
                             recom_idx = 0
-                        state.save_state(cur, processed, recom_idx, snapshot())
+                        state.save_state(cur, processed, recom_idx, snapshot(), store_index)
                         state._set_snap(self.progress, status="running", processed_index=processed,
                                         total_rows=total, current_recom_index=recom_idx, interval=interval)
 
@@ -285,11 +370,15 @@ class DailyWorker:
                     auth_fail += 1
                     print(f"[AUTH] HTTP {status}（连续 {auth_fail}）登录态可能失效")
                     if auth_fail >= 3:
-                        print("[AUTH] 连续 3 次，停止 client 等待退避重试")
-                        state.save_state(cur, processed, recom_idx, snapshot())
+                        state.save_state(cur, processed, recom_idx, snapshot(), store_index)
                         state._set_snap(self.progress, status="auth_failed",
                                         last_error=f"HTTP {status} 连续 {auth_fail} 次")
-                        self._sleep(300)
+                        if self.one_shot:
+                            print("[AUTH] 连续 3 次且为批处理模式：存断点立即退出（登录态失效/账号冻结，"
+                                  "不空睡，交由主循环收口、次日链再试）")
+                        else:
+                            print("[AUTH] 连续 3 次，停止 client，300s 退避后由主循环判是否达停止轮数")
+                            self._sleep(300)
                         return
                 elif status == 429:
                     interval = min(interval * 2, config.BACKOFF_CAP)
@@ -309,7 +398,7 @@ class DailyWorker:
                         if recom_idx >= len(config.RECOM_TYPES):
                             processed += 1
                             recom_idx = 0
-                        state.save_state(cur, processed, recom_idx, snapshot())
+                        state.save_state(cur, processed, recom_idx, snapshot(), store_index)
                     else:
                         print(f"[WARN] ({processed},{recom}) status={status} "
                               f"retry={n}/{config.MAX_RETRY_PER_ROW} raw={(raw or '')[:120]}")
@@ -318,7 +407,7 @@ class DailyWorker:
         finally:
             self._close_writers()
             client.stop()
-            state.save_state(cur, processed, recom_idx, snapshot())
+            state.save_state(cur, processed, recom_idx, snapshot(), store_index)
             state._set_snap(self.progress, processed_index=processed, total_rows=total)
         if switched:
             print(f"[SWITCH] 已切到新 input，回主循环重载")
@@ -376,3 +465,37 @@ class DailyWorker:
         state._set_snap(self.progress, status="stopped", reason=reason,
                         processed_index=st.get("processed_index"))
         print(f"[FINISH] {reason}")
+
+
+def check_due():
+    """每小时巡检的轻量预检：不起浏览器、不碰 fetch_all，只判断“本轮要不要进链”。
+
+    返回 (due, reason)。due=True 才值得去停 fetch_all、跑 batch。策略：**每天只跑最新文件，
+    跑过的文件（写过 day_done，无论 done 还是 quota）一律丢弃不再续跑**。判据：
+        - 已有实例持锁（上一轮 batch 还在跑）→ 不进链（避免重复起链、误唤醒 fetch_all）
+        - OSS 最新 input 日期 != 上次跑的日期 → 来了更新的文件，进链（切最新、从第 0 词跑）
+        - 最新==上次且该文件已有 day_done → 跳过（这份跑过了，丢弃，等更新文件）
+        - 最新==上次、无 day_done 且文件日期==今天 → 当天崩在中途，进链从断点原地恢复
+        - 最新==上次、无 day_done 但文件日期不是今天（往日没跑完且今天无新文件）→ 跳过，不补跑
+    """
+    if not state.acquire_lock():
+        return False, "已有 wb_querywords 实例在运行，本轮跳过"
+    state.release_lock()
+    try:
+        bucket = oss_uploader.get_bucket()
+        latest = oss_uploader.max_input_date(bucket)
+    except Exception as exc:
+        return False, f"OSS 读取失败，本轮跳过: {type(exc).__name__}: {str(exc)[:120]}"
+    last = state.load_state().get("input_date")
+    dd = state.load_day_done()
+    if latest and latest != last:
+        return True, f"发现更新 input {latest}（上次 {last}），切新文件从第 0 词跑"
+    if not last:
+        return False, "OSS 无可用 input 日期，跳过"
+    if dd.get("input_date") == last:
+        return False, f"input {last} 已跑过（day_done={dd.get('status')}），丢弃不续，等更新文件"
+    # 最新==上次且无 day_done：仅当这份就是今日日期的文件才当作“当天崩在中途”可原地恢复；
+    # 否则是往日文件且今天没出新文件 → 按策略不补（配额宁可闲着）。
+    if last == config.today_bjt_str():
+        return True, f"续跑当天未完成 input {last}（无 day_done，当日中断恢复）"
+    return False, f"input {last} 非今日且无更新文件，按策略不补跑（配额闲置）"
