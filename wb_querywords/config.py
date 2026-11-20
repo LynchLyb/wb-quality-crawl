@@ -17,9 +17,12 @@ INPUT_DIR = os.path.join(MODULE_DIR, "input")
 OUTPUT_DIR = os.path.join(MODULE_DIR, "output")
 
 # ---------------------------------------------------------------- 店铺与登录
-# 用哪个店 profile 起浏览器（该店 profile 需已在生产机登录过 WB，DPAPI 才能解 cookie）。
-# A 机现有 4 店（store1-store4）；store1 是长期在跑的默认店。
-STORE_ID = "store1"
+# **B 机只有一个店铺**：接力链退化为单店（链里就一个 id）。对比推荐配额按店计，
+# 单店当日跑满/命中 limitExceeded 即收尾（无下一店可接），day_done 记 quota 后丢弃、等更新日期文件。
+# 用哪个店 profile 起浏览器（该店 profile 需已在生产机登录过 WB，DPAPI 才能解 cookie）；
+# 具体卖家 ID 见生产机本地 config.json（勿写入代码/提交），店铺代号绑定不可改。
+STORE_IDS = ["store1"]             # B 机单店：有序链只有一个
+STORE_ID = STORE_IDS[0]            # 兼容旧引用（api_client 默认店）
 
 # ---------------------------------------------------------------- 运行参数
 # A 分支: 只跑 searchViewItem 一路
@@ -47,6 +50,9 @@ RATE_LIMIT_PAUSE = 30                  # 429 后基础暂停
 BACKOFF_CAP = 300                      # 429 连撞暂停上限
 CLEAN_STREAK = 50                      # 连续成功 N 次把 interval 缩回基线
 MAX_RETRY_PER_ROW = 3                  # 单行连续非 2xx 失败上限（超过跳过该行）
+# 连续 auth_failed（401/403×3，登录态失效/账号冻结）达此轮数则存断点退出进程，
+# 交回人工：常驻需 /resume 重登后再起，batch 则由次日计划任务链再试。one_shot 命中首轮即退。
+AUTH_FAIL_STOP_ROUNDS = 3
 
 # ---------------------------------------------------------------- 输出
 # 每行 = 一条推荐结果；searchText/recomType 为入参上下文，nmID/title/mainPhoto 来自响应 data[]
@@ -103,8 +109,13 @@ def local_input_path(date_str):
 
 
 def type_output_dir(recom_type):
-    """某 recomType 的本地输出目录（临时分片 + 合并产物按类型分目录，A/B 各自隔离）。"""
+    """某 recomType 的本地输出根目录：合并产物 <date>.csv 落此，各店分片落其下的 <store>/ 子目录。"""
     return os.path.join(OUTPUT_DIR, recom_type)
+
+
+def store_output_dir(recom_type, store):
+    """某 recomType 下某店的本地工作区目录：output/<recomType>/<store>/（分片按店隔离）。"""
+    return os.path.join(type_output_dir(recom_type), store)
 
 
 def shard_filename(recom_type, shard_index, date_str):
@@ -112,9 +123,9 @@ def shard_filename(recom_type, shard_index, date_str):
     return f"{date_str}_{recom_type}_shard_{shard_index:03d}.csv"
 
 
-def shard_path(recom_type, shard_index, date_str):
-    """本地临时分片绝对路径（在类型子目录下）。"""
-    return os.path.join(type_output_dir(recom_type), shard_filename(recom_type, shard_index, date_str))
+def shard_path(recom_type, store, shard_index, date_str):
+    """本地临时分片绝对路径：output/<recomType>/<store>/<file>（按店分目录）。"""
+    return os.path.join(store_output_dir(recom_type, store), shard_filename(recom_type, shard_index, date_str))
 
 
 def merged_filename(date_str):
@@ -123,10 +134,10 @@ def merged_filename(date_str):
 
 
 def merged_path(recom_type, date_str):
-    """合并后本地文件绝对路径：output/<recomType>/<date>.csv。"""
+    """合并后本地文件绝对路径：output/<recomType>/<date>.csv（跨店分片合成一份，不分店）。"""
     return os.path.join(type_output_dir(recom_type), merged_filename(date_str))
 
 
 def oss_output_key(recom_type, date_str):
-    """OSS 上传 key：wb_querywords/output/<recomType>/<date>.csv。"""
+    """OSS 上传 key：wb_querywords/output/<recomType>/<date>.csv（**不含店维度**，各店分片合并成一份，布局与单店一致）。"""
     return f"{OSS_OUTPUT_PREFIX}{recom_type}/{merged_filename(date_str)}"

@@ -95,13 +95,14 @@ def read_pairs(input_path):
 
 # ------------------------------------------------------------ 本地临时分片写入
 class ShardWriter:
-    """某 recomType 的本地临时分片写入器：按分片序号即时 append（每次调用一刷，崩溃不丢）。
+    """某 recomType 某店的本地临时分片写入器：按分片序号即时 append（每次调用一刷，崩溃不丢）。
 
-    分片落在 output/<recomType>/ 下；日期用 input 日期（一对一）。
+    分片落在 output/<recomType>/<store>/ 下（多店接力各写各店，互不混写）；日期用 input 日期（一对一）。
     """
 
-    def __init__(self, recom_type, date_str):
+    def __init__(self, recom_type, store, date_str):
         self.recom = recom_type
+        self.store = store
         self.date = date_str
         self._open_idx = None
         self._fh = None
@@ -110,7 +111,7 @@ class ShardWriter:
         if self._open_idx == shard_index and self._fh is not None:
             return
         self.close()
-        path = config.shard_path(self.recom, shard_index, self.date)
+        path = config.shard_path(self.recom, self.store, shard_index, self.date)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         new_file = not os.path.exists(path)
         self._fh = io.open(path, "a", encoding="utf-8-sig", newline="")
@@ -148,18 +149,19 @@ class ShardWriter:
         self._open_idx = None
 
     def path(self, shard_index):
-        return config.shard_path(self.recom, shard_index, self.date)
+        return config.shard_path(self.recom, self.store, shard_index, self.date)
 
 
 # ------------------------------------------------------------ 合并分片为最终文件
 def shard_glob(recom_type, date_str):
-    """某类型某日期的全部临时分片路径（glob 模式）。"""
-    return os.path.join(config.type_output_dir(recom_type), f"{date_str}_*_shard_*.csv")
+    """某类型某日期的全部临时分片路径（glob 模式）：跨该类型下**所有店**子目录（接力无重叠）。"""
+    return os.path.join(config.type_output_dir(recom_type), "*", f"{date_str}_*_shard_*.csv")
 
 
 def merge_shards(recom_type, date_str):
-    """把该类型该日期的全部分片合并成 output/<recomType>/<date>.csv（单表头 + 全数据行）。
+    """把该类型该日期的全部分片（跨多店）合并成 output/<recomType>/<date>.csv（单表头 + 全数据行）。
 
+    接力共享游标、两店分片无重叠，按店目录名 + 分片序号排序后拼接即完整。
     返回合并后本地路径；无分片返回 None。
     """
     shards = sorted(glob.glob(shard_glob(recom_type, date_str)))
