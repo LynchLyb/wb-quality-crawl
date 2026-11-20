@@ -42,9 +42,9 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot    = "C:\Users\yuanbo\PycharmProjects\WelcomeScreen"  # 项目根目录
 $Python         = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $FetchHostBase  = "http://127.0.0.1:8080"   # fetch_all 常驻宿主（根 app.py）
-# B 机单店：batch 只起 store1 一个店的浏览器（独立 profile），故只需停下 store1 的
+# B 机单店：batch 只起 store2 一个店的浏览器（独立 profile），故只需停下 store2 的
 # fetch_all worker 释放 profile，跑完 batch 再拉起。需与 wb_querywords/config.py 的 STORE_IDS 对齐。
-$Stores         = @("store1")                # B 机单店，与 config.STORE_IDS 一致
+$Stores         = @("store2")                # B 机单店，与 config.STORE_IDS 一致
 $StopTimeoutSec = 180                       # 等 fetch_all worker 优雅退出的上限（秒）
 # 巡检窗口：仅在该时段内每小时进链（含端点），窗口外直接退出、连预检都不做，绝不碰 fetch_all。
 # 与计划任务的 /ST /ET 双保险：任务层窗口外不 spawn，脚本层再兜一道（防有人把任务重登记成全时段）。

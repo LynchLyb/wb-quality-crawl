@@ -21,7 +21,7 @@ OUTPUT_DIR = os.path.join(MODULE_DIR, "output")
 # 单店当日跑满/命中 limitExceeded 即收尾（无下一店可接），day_done 记 quota 后丢弃、等更新日期文件。
 # 用哪个店 profile 起浏览器（该店 profile 需已在生产机登录过 WB，DPAPI 才能解 cookie）；
 # 具体卖家 ID 见生产机本地 config.json（勿写入代码/提交），店铺代号绑定不可改。
-STORE_IDS = ["store1"]             # B 机单店：有序链只有一个
+STORE_IDS = ["store2"]             # B 机单店：有序链只有一个（本机 store1 已在 config.local.json 禁用，卖家 250149024 实登在 store2/chrome_profile）
 STORE_ID = STORE_IDS[0]            # 兼容旧引用（api_client 默认店）
 
 # ---------------------------------------------------------------- 运行参数
