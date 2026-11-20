@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     wb_querywords 串行链（每小时巡检）：有新 input 或未完成进度才跑搜索词 batch，跑完再交回 fetch_all。
