@@ -290,47 +290,50 @@ class DailyWorker:
                 recom = config.RECOM_TYPES[recom_idx]
                 status, recs, raw, error_text = client.query(search_text, recom)
 
+                if error_text and "limitExceeded" in error_text:
+                    # WB 会把日配额拒绝包装成 HTTP 429：该判断必须提前到所有状态码分支之上，
+                    # 否则配额路径不可达，batch 会无限退避而不切店（已两度实测踩坑）。
+                    # 该店每日对比推荐配额用尽：不写占位、不前进（当前词留给下一店或明日）
+                    if store_index < len(self.store_ids) - 1:
+                        nxt = self.store_ids[store_index + 1]
+                        print(f"[QUOTA] 店 {self.store_id} 配额用尽 '{search_text[:40]}'（{recom}）："
+                              f"切下一店 {nxt} 从词 {processed} 续跑（词不丢不重）")
+                        try:
+                            client.stop()
+                        except Exception:
+                            pass
+                        store_index += 1
+                        self.store_index = store_index
+                        try:
+                            client = self._start_client(store_index)
+                        except Exception as exc:
+                            msg = f"{type(exc).__name__}: {str(exc)[:150]}"
+                            print(f"[CLIENT][X] 切店 {self.store_id} 起浏览器失败: {msg}，存断点退避重试")
+                            state.save_state(cur, processed, recom_idx, snapshot(), store_index)
+                            state._set_snap(self.progress, status="client_error", last_error=msg)
+                            self._sleep(60)
+                            return
+                        # 新店重查同一个词：分片从头，重置该店速率/重试计数
+                        writers, calls, shard_index = open_store_writers(self.store_id, {})
+                        interval = config.CALL_INTERVAL
+                        clean_streak = 0
+                        auth_fail = 0
+                        row_retry = {}
+                        state.save_state(cur, processed, recom_idx, snapshot(), store_index)
+                        state._set_snap(self.progress, status="running", store_index=store_index,
+                                        store_id=self.store_id, processed_index=processed)
+                        continue
+                    # 已是回退链最后一个店：全部店配额用尽，存断点后收尾退出（未跑完词留待明日）
+                    print(f"[QUOTA] limitExceeded 命中 '{search_text[:40]}'（{recom}）：全部店铺当日配额用尽，存断点退出")
+                    state.save_state(cur, processed, recom_idx, snapshot(), store_index)
+                    state._set_snap(self.progress, status="quota_exhausted",
+                                    last_error="content.analytics.limitExceeded",
+                                    processed_index=processed, total_rows=total)
+                    self._quota_exhausted = True
+                    return
+
                 if 200 <= status < 300:
                     auth_fail = 0
-                    if error_text and "limitExceeded" in error_text:
-                        # 该店每日对比推荐配额用尽：不写占位、不前进（当前词留给下一店或明日）
-                        if store_index < len(self.store_ids) - 1:
-                            nxt = self.store_ids[store_index + 1]
-                            print(f"[QUOTA] 店 {self.store_id} 配额用尽 '{search_text[:40]}'（{recom}）："
-                                  f"切下一店 {nxt} 从词 {processed} 续跑（词不丢不重）")
-                            try:
-                                client.stop()
-                            except Exception:
-                                pass
-                            store_index += 1
-                            self.store_index = store_index
-                            try:
-                                client = self._start_client(store_index)
-                            except Exception as exc:
-                                msg = f"{type(exc).__name__}: {str(exc)[:150]}"
-                                print(f"[CLIENT][X] 切店 {self.store_id} 起浏览器失败: {msg}，存断点退避重试")
-                                state.save_state(cur, processed, recom_idx, snapshot(), store_index)
-                                state._set_snap(self.progress, status="client_error", last_error=msg)
-                                self._sleep(60)
-                                return
-                            # 新店重查同一个词：分片从头，重置该店速率/重试计数
-                            writers, calls, shard_index = open_store_writers(self.store_id, {})
-                            interval = config.CALL_INTERVAL
-                            clean_streak = 0
-                            auth_fail = 0
-                            row_retry = {}
-                            state.save_state(cur, processed, recom_idx, snapshot(), store_index)
-                            state._set_snap(self.progress, status="running", store_index=store_index,
-                                            store_id=self.store_id, processed_index=processed)
-                            continue
-                        # 已是回退链最后一个店：全部店配额用尽，存断点后收尾退出（未跑完词留待明日）
-                        print(f"[QUOTA] limitExceeded 命中 '{search_text[:40]}'（{recom}）：全部店铺当日配额用尽，存断点退出")
-                        state.save_state(cur, processed, recom_idx, snapshot(), store_index)
-                        state._set_snap(self.progress, status="quota_exhausted",
-                                        last_error="content.analytics.limitExceeded",
-                                        processed_index=processed, total_rows=total)
-                        self._quota_exhausted = True
-                        return
                     if error_text:
                         # 其它业务错误（非配额）：按单行重试上限处理，超限写空占位前进
                         key = (processed, recom_idx)

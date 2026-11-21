@@ -118,8 +118,9 @@ class RecoClient:
 
         响应结构（实测）: {"error": false, "errorText": "", "data": [{nmID,title,mainPhoto,...}, ...]}
         - parsed_list 即 data 数组（每条推荐一个 dict）；失败/非 200/error=true 时为 None。
-        - error_text：2xx 且 error=true 时为响应里的 errorText（如 content.analytics.limitExceeded，
-          表示每日对比推荐配额已用尽）；其余情况为空串 ""。调用方据此区分"配额限流/业务错误/真空结果"。
+        - error_text：error=true 时为响应里的 errorText（如 content.analytics.limitExceeded，
+          表示每日对比推荐配额已用尽）；其余情况为空串 ""。**不论状态码都解析**：WB 会把配额拒绝
+          包装成 HTTP 429，只在 2xx 分支解析会让配额路径不可达、batch 陷入无限退避不切店。
         """
         if self.driver is None or self.headers is None:
             raise RuntimeError("RecoClient 未启动")
@@ -128,22 +129,21 @@ class RecoClient:
         status, text = call_api(self.driver, config.RECO_URL, "POST", self.headers, post)
         recs = None
         error_text = ""
-        if 200 <= status < 300:
-            try:
-                j = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                j = None
-            if isinstance(j, dict):
-                if j.get("error"):
-                    # 业务错误：透出 errorText 交调用方分类（配额/其它）
-                    error_text = str(j.get("errorText") or "")
-                else:
-                    data = j.get("data")
-                    if isinstance(data, list):
-                        recs = data
-                    elif isinstance(data, dict) and isinstance(data.get("recommendations"), list):
-                        recs = data["recommendations"]
-                    elif isinstance(j.get("recommendations"), list):
-                        recs = j["recommendations"]
+        try:
+            j = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            j = None
+        if isinstance(j, dict):
+            if j.get("error"):
+                # 业务错误（含被包装成 429 的日配额拒绝）：透出 errorText 交调用方分类（配额/其它）
+                error_text = str(j.get("errorText") or "")
+            elif 200 <= status < 300:
+                data = j.get("data")
+                if isinstance(data, list):
+                    recs = data
+                elif isinstance(data, dict) and isinstance(data.get("recommendations"), list):
+                    recs = data["recommendations"]
+                elif isinstance(j.get("recommendations"), list):
+                    recs = j["recommendations"]
         return status, recs, text, error_text
 
